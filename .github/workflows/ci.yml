@@ -62,5 +62,5 @@ jobs:
       - name: Smoke-test wheel
         run: |
           python -m venv /tmp/ynab-wheel-smoke
-          /tmp/ynab-wheel-smoke/bin/python -m pip install --no-deps dist/*.whl
+          /tmp/ynab-wheel-smoke/bin/python -m pip install dist/*.whl
           /tmp/ynab-wheel-smoke/bin/ynab --help
