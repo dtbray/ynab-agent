@@ -1,0 +1,1 @@
+"""Typed analytical report services."""

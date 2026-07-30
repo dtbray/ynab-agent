@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install project
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+          python -m pip install -e ".[dev,planner,historical,reports]"
+
+      - name: Compile
+        run: python -m compileall src tests migrations
+
+      - name: Lint
+        run: python -m ruff check src tests migrations
+
+      - name: Test
+        run: python -m pytest
+
+      - name: Type-check planning boundaries
+        run: |
+          python -m mypy \
+            src/ynab_agent/planning \
+            src/ynab_agent/services/wealth.py \
+            src/ynab_agent/services/spending_guardrails.py \
+            src/ynab_agent/services/scenario_comparison.py \
+            src/ynab_agent/db/wealth.py \
+            src/ynab_agent/db/spending_guardrails.py \
+            src/ynab_agent/db/scenario_comparison.py \
+            src/ynab_agent/http_api/routers/spending_guardrails.py \
+            src/ynab_agent/http_api/routers/scenario_comparison.py \
+            src/ynab_agent/http_api/schemas/spending_guardrails.py \
+            src/ynab_agent/http_api/schemas/scenario_comparison.py
+
+      - name: Build wheel
+        run: python -m build --wheel

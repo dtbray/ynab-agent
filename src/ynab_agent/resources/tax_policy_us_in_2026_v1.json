@@ -1,0 +1,119 @@
+{
+  "policy_id": "us_in_2026_v1",
+  "effective_year": 2026,
+  "published_as_of": "2026-07-30",
+  "federal": {
+    "ordinary_brackets": {
+      "married_filing_jointly": [[24800, 0.10], [100800, 0.12], [211400, 0.22], [403550, 0.24], [512450, 0.32], [768700, 0.35], [null, 0.37]],
+      "qualifying_surviving_spouse": [[24800, 0.10], [100800, 0.12], [211400, 0.22], [403550, 0.24], [512450, 0.32], [768700, 0.35], [null, 0.37]],
+      "head_of_household": [[17700, 0.10], [67450, 0.12], [105700, 0.22], [201750, 0.24], [256200, 0.32], [640600, 0.35], [null, 0.37]],
+      "single": [[12400, 0.10], [50400, 0.12], [105700, 0.22], [201775, 0.24], [256225, 0.32], [640600, 0.35], [null, 0.37]],
+      "married_filing_separately": [[12400, 0.10], [50400, 0.12], [105700, 0.22], [201775, 0.24], [256225, 0.32], [384350, 0.35], [null, 0.37]]
+    },
+    "standard_deduction": {
+      "married_filing_jointly": 32200,
+      "qualifying_surviving_spouse": 32200,
+      "head_of_household": 24150,
+      "single": 16100,
+      "married_filing_separately": 16100
+    },
+    "additional_standard_deduction_aged_or_blind": {
+      "married": 1650,
+      "unmarried": 2050
+    },
+    "enhanced_senior_deduction": {
+      "amount_per_eligible_person": 6000,
+      "expires_after_year": 2028,
+      "phaseout_rate": 0.06,
+      "phaseout_start": {
+        "married_filing_jointly": 150000,
+        "qualifying_surviving_spouse": 75000,
+        "head_of_household": 75000,
+        "single": 75000,
+        "married_filing_separately": 75000
+      }
+    },
+    "capital_gains": {
+      "married_filing_jointly": [98900, 613700],
+      "qualifying_surviving_spouse": [98900, 613700],
+      "head_of_household": [66200, 579600],
+      "single": [49450, 545500],
+      "married_filing_separately": [49450, 306850]
+    },
+    "social_security": {
+      "married_filing_jointly": [32000, 44000],
+      "qualifying_surviving_spouse": [25000, 34000],
+      "head_of_household": [25000, 34000],
+      "single": [25000, 34000],
+      "married_filing_separately": [25000, 34000],
+      "married_filing_separately_lived_together": [0, 0],
+      "maximum_taxable_fraction": 0.85
+    }
+  },
+  "indiana": {
+    "rate_by_year": {"2026": 0.0295, "2027": 0.029},
+    "rate_after_last_year": 0.029,
+    "personal_exemption": 1000,
+    "dependent_child_additional_exemption": 1500,
+    "first_time_adopted_child_additional_exemption": 3000,
+    "aged_or_blind_exemption": 1000,
+    "low_income_aged_exemption": 500,
+    "low_income_aged_agi_limit": 40000,
+    "low_income_aged_agi_limit_married_separate": 20000,
+    "social_security_exempt": true
+  },
+  "rmd": {
+    "start_age_by_birth_year": [
+      {"latest_birth_year": 1948, "age": 70},
+      {"latest_birth_year": 1950, "age": 72},
+      {"latest_birth_year": 1959, "age": 73},
+      {"latest_birth_year": null, "age": 75}
+    ],
+    "uniform_lifetime_divisors": {
+      "72": 27.4, "73": 26.5, "74": 25.5, "75": 24.6, "76": 23.7,
+      "77": 22.9, "78": 22.0, "79": 21.1, "80": 20.2, "81": 19.4,
+      "82": 18.5, "83": 17.7, "84": 16.8, "85": 16.0, "86": 15.2,
+      "87": 14.4, "88": 13.7, "89": 12.9, "90": 12.2, "91": 11.5,
+      "92": 10.8, "93": 10.1, "94": 9.5, "95": 8.9, "96": 8.4,
+      "97": 7.8, "98": 7.3, "99": 6.8, "100": 6.4, "101": 6.0,
+      "102": 5.6, "103": 5.2, "104": 4.9, "105": 4.6, "106": 4.3,
+      "107": 4.1, "108": 3.9, "109": 3.7, "110": 3.5, "111": 3.4,
+      "112": 3.3, "113": 3.1, "114": 3.0, "115": 2.9, "116": 2.8,
+      "117": 2.7, "118": 2.5, "119": 2.3, "120": 2.0
+    }
+  },
+  "aca": {
+    "coverage_year": 2026,
+    "poverty_guideline_year": 2025,
+    "contiguous_us_fpl": {"1": 15650, "2": 21150, "3": 26650, "4": 32150, "5": 37650, "6": 43150, "7": 48650, "8": 54150},
+    "additional_person": 5500,
+    "applicable_percentage_table": [[0, 133, 0.021, 0.021], [133, 150, 0.0314, 0.0419], [150, 200, 0.0419, 0.066], [200, 250, 0.066, 0.0844], [250, 300, 0.0844, 0.0996], [300, 400, 0.0996, 0.0996]],
+    "minimum_fpl_percentage": 100,
+    "maximum_fpl_percentage": 400,
+    "employer_affordability_percentage": 0.0996
+  },
+  "irmaa": {
+    "premium_year": 2026,
+    "lookback_years": 2,
+    "part_b_standard_monthly_premium": 202.90,
+    "individual_thresholds": [109000, 137000, 171000, 205000, 500000],
+    "joint_thresholds": [218000, 274000, 342000, 410000, 750000],
+    "married_filing_separately_lived_together_thresholds": [109000, 391000],
+    "part_b_monthly_adjustments": [0, 81.20, 202.90, 324.60, 446.30, 487.00],
+    "part_d_monthly_adjustments": [0, 14.50, 37.50, 60.40, 83.30, 91.00]
+  },
+  "sources": [
+    {"authority": "IRS", "title": "Revenue Procedure 2025-32", "url": "https://www.irs.gov/irb/2025-45_IRB#REV-PROC-2025-32", "effective_years": [2026]},
+    {"authority": "IRS", "title": "Publication 915 (2025), Social Security and Equivalent Railroad Retirement Benefits", "url": "https://www.irs.gov/pub/irs-pdf/p915.pdf", "effective_years": [2026]},
+    {"authority": "IRS", "title": "Publication 590-B, Uniform Lifetime Table", "url": "https://www.irs.gov/publications/p590b", "effective_years": [2026]},
+    {"authority": "Federal Register / IRS", "title": "Final required minimum distribution regulations, TD 10001", "url": "https://www.irs.gov/pub/irs-irbs/irb24-33.pdf", "effective_years": [2026]},
+    {"authority": "Public Law 119-21", "title": "Temporary senior deduction, section 70103", "url": "https://www.govinfo.gov/app/details/PLAW-119publ21", "effective_years": [2025, 2026, 2027, 2028]},
+    {"authority": "Indiana DOR", "title": "Individual adjusted gross income tax rates", "url": "https://www.in.gov/dor/resources/tax-rates-and-reports/rates-fees-and-penalties/", "effective_years": [2026, 2027]},
+    {"authority": "Indiana DOR", "title": "Individual deductions", "url": "https://www.in.gov/dor/i-am-a/individual/deductions/", "effective_years": [2026]},
+    {"authority": "Indiana DOR", "title": "Low-income taxpayer exemptions", "url": "https://www.in.gov/dor/i-am-a/individual/low-income-taxpayers/", "effective_years": [2026]},
+    {"authority": "IRS", "title": "Revenue Procedure 2025-25, 2026 Premium Tax Credit percentages", "url": "https://www.irs.gov/irb/2025-32_IRB#REV-PROC-2025-25", "effective_years": [2026]},
+    {"authority": "HealthCare.gov", "title": "Federal Poverty Level", "url": "https://www.healthcare.gov/glossary/federal-poverty-level-fpl/", "effective_years": [2025, 2026]},
+    {"authority": "CMS", "title": "2026 Medicare Parts A & B Premiums and Deductibles", "url": "https://www.cms.gov/newsroom/fact-sheets/2026-medicare-parts-b-premiums-deductibles", "effective_years": [2026]},
+    {"authority": "SSA", "title": "POMS HI 01101.010 Modified Adjusted Gross Income", "url": "https://secure.ssa.gov/poms.nsf/lnx/0601101010", "effective_years": [2026]}
+  ]
+}

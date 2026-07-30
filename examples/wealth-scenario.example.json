@@ -1,0 +1,71 @@
+{
+  "name": "VTSAX-like baseline retirement",
+  "current_age": 45,
+  "retirement_age": 65,
+  "end_age": 95,
+  "starting_portfolio": 500000,
+  "accounts": [],
+  "annual_contribution": 24000,
+  "contribution_inflation_adjusted": true,
+  "annual_spending": 72000,
+  "spending_tiers": [
+    {
+      "name": "essential",
+      "annual_amount": 48000
+    },
+    {
+      "name": "comfortable",
+      "annual_amount": 60000
+    }
+  ],
+  "legacy_target_real": 250000,
+  "income_streams": [
+    {
+      "name": "Social Security estimate",
+      "start_age": 67,
+      "annual_amount": 36000,
+      "inflation_adjusted": true,
+      "tax_treatment": "social_security"
+    }
+  ],
+  "cash_flow_streams": [],
+  "tax_buckets": [
+    {
+      "tax_treatment": "tax_deferred",
+      "starting_balance": 350000,
+      "contribution_fraction": 1
+    },
+    {
+      "tax_treatment": "roth",
+      "starting_balance": 100000
+    },
+    {
+      "tax_treatment": "taxable",
+      "starting_balance": 50000,
+      "taxable_basis": 40000
+    }
+  ],
+  "tax_assumptions": {
+    "ordinary_income_tax_rate": 0.12,
+    "long_term_capital_gains_tax_rate": 0.15,
+    "social_security_taxable_fraction": 0.85,
+    "qualified_hsa_withdrawal_fraction": 1,
+    "rmd_start_age": 75,
+    "apply_required_minimum_distributions": true,
+    "withdrawal_order": [
+      "taxable",
+      "tax_deferred",
+      "roth"
+    ],
+    "retirement_surplus_destination": "taxable"
+  },
+  "inflation_rate": 0.025,
+  "return_model": "lognormal",
+  "return_mean": 0.06,
+  "return_volatility": 0.16,
+  "historical_block_size": 5,
+  "annual_fee_rate": 0.002,
+  "withdrawal_tax_rate": 0,
+  "trials": 10000,
+  "seed": 20260728
+}
