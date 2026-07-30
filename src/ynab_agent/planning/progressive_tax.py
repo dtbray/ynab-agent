@@ -146,6 +146,9 @@ class IncomeTaxArrayResult:
     total_income_tax: Any
     taxable_social_security: Any
     federal_deduction: Any
+    federal_adjusted_gross_income: Any
+    federal_taxable_income: Any
+    federal_taxable_ordinary_income: Any
 
 
 @lru_cache(maxsize=1)
@@ -667,6 +670,9 @@ def calculate_income_tax_component_arrays(
             total_income_tax=federal_income_tax,
             taxable_social_security=taxable_social_security,
             federal_deduction=deduction,
+            federal_adjusted_gross_income=federal_agi,
+            federal_taxable_income=taxable_income,
+            federal_taxable_ordinary_income=taxable_ordinary,
         )
     indiana = policy["indiana"]
     rate = indiana["rate_by_year"].get(
@@ -707,7 +713,99 @@ def calculate_income_tax_component_arrays(
         total_income_tax=federal_income_tax + indiana_tax,
         taxable_social_security=taxable_social_security,
         federal_deduction=deduction,
+        federal_adjusted_gross_income=federal_agi,
+        federal_taxable_income=taxable_income,
+        federal_taxable_ordinary_income=taxable_ordinary,
     )
+
+
+def federal_ordinary_bracket_ceiling(
+    assumptions: ProgressiveTaxAssumptions,
+    *,
+    tax_year: int,
+    rate: float,
+) -> float:
+    """Return the indexed upper taxable-income edge for a bounded bracket."""
+    policy, _ = load_tax_policy()
+    factor = (
+        1.0
+        if assumptions.future_policy_mode is FutureTaxPolicyMode.FIXED_NOMINAL
+        else (1 + assumptions.bracket_inflation_rate) ** (
+            tax_year - policy["effective_year"]
+        )
+    )
+    for upper, bracket_rate in policy["federal"]["ordinary_brackets"][
+        assumptions.filing_status.value
+    ]:
+        if float(bracket_rate) == rate:
+            if upper is None:
+                raise ValueError("the top ordinary bracket has no fill ceiling")
+            return _rounded_indexed(float(upper), factor)
+    raise ValueError("unsupported federal ordinary bracket rate")
+
+
+def federal_capital_gain_bracket_ceiling(
+    assumptions: ProgressiveTaxAssumptions,
+    *,
+    tax_year: int,
+    rate: float,
+) -> float:
+    """Return the indexed upper taxable-income edge for the 0% or 15% band."""
+    policy, _ = load_tax_policy()
+    factor = (
+        1.0
+        if assumptions.future_policy_mode is FutureTaxPolicyMode.FIXED_NOMINAL
+        else (1 + assumptions.bracket_inflation_rate) ** (
+            tax_year - policy["effective_year"]
+        )
+    )
+    thresholds = policy["federal"]["capital_gains"][assumptions.filing_status.value]
+    index = 0 if rate == 0 else 1 if rate == 0.15 else None
+    if index is None:
+        raise ValueError("capital-gain bracket rate must be 0% or 15%")
+    return _rounded_indexed(float(thresholds[index]), factor)
+
+
+def calculate_irmaa_surcharge_arrays(
+    assumptions: ProgressiveTaxAssumptions,
+    *,
+    tax_year: int,
+    lookback_magi: Any | None,
+) -> Any:
+    """Return current-year Part B and D IRMAA surcharges from prior MAGI."""
+    import numpy as np
+
+    if lookback_magi is None:
+        return np.asarray(0.0)
+    policy, _ = load_tax_policy()
+    irmaa = policy["irmaa"]
+    magi = np.asarray(lookback_magi, dtype=float)
+    eligible_people = int(tax_year - assumptions.taxpayer_birth_year >= 65)
+    if assumptions.spouse_birth_year is not None:
+        eligible_people += int(tax_year - assumptions.spouse_birth_year >= 65)
+    if eligible_people == 0:
+        return np.zeros_like(magi)
+    if (
+        assumptions.filing_status is FederalFilingStatus.MARRIED_FILING_SEPARATELY
+        and assumptions.married_filing_separately_lived_with_spouse
+    ):
+        lower, upper = irmaa[
+            "married_filing_separately_lived_together_thresholds"
+        ]
+        tier = np.where(magi <= lower, 0, np.where(magi < upper, 4, 5))
+    else:
+        thresholds = irmaa[
+            "joint_thresholds"
+            if assumptions.filing_status is FederalFilingStatus.MARRIED_FILING_JOINTLY
+            else "individual_thresholds"
+        ]
+        tier = np.zeros_like(magi, dtype=int)
+        for threshold in thresholds[:-1]:
+            tier += magi > threshold
+        tier += magi >= thresholds[-1]
+    part_b = np.asarray(irmaa["part_b_monthly_adjustments"], dtype=float)
+    part_d = np.asarray(irmaa["part_d_monthly_adjustments"], dtype=float)
+    return 12 * eligible_people * (part_b[tier] + part_d[tier])
 
 
 def rmd_start_age(birth_year: int) -> int:

@@ -2,9 +2,68 @@
 
 ## Unreleased
 
+### Added
+- Add allowlisted, fail-closed private-source automation that exports and
+  verifies the public distribution before opening a protected GitHub pull
+  request.
+- Publish source and wheel artifacts as a GitHub release after a release-sync
+  pull request passes review and is merged.
+
+### Changed
+- Declare complete SPDX license, author, project URL, classifier, keyword, and
+  typing metadata in built distributions.
+- Build and validate both source distributions and wheels in public CI.
+
+## 0.7.0 - 2026-07-30
+
+### Added
+- Add versioned bracket-fill Roth-conversion and capital-gain-harvest rules,
+  ordered or proportional withdrawals, and typed advisory asset-location
+  preferences.
+- Report deterministic annual tax actions, two-year Medicare IRMAA exposure,
+  and real lifetime IRMAA surcharges alongside taxes and after-tax estate
+  outcomes.
+- Submit tax-strategy simulations through a dedicated authenticated API alias
+  backed by the durable planner queue, and inspect schedules with
+  `ynab wealth tax-strategy`.
+- Model one- and two-person household work, pension, longevity, retirement,
+  Social Security, survivor-spending, and filing-status timelines.
+- Compare Social Security claiming ages 62 through 70 on common market and
+  longevity paths using household taxes, funded spending, and portfolio
+  outcomes rather than cumulative benefits alone.
+- Preserve per-person ownership for duplicate tax-treatment accounts, including
+  owner-specific basis, RMDs, withdrawals, and auditable public aggregation.
+
 ### Changed
 - License the project under the GNU Affero General Public License v3.0 or
   later.
+- Compare tax strategies on common market paths with IRMAA, funded-spending,
+  shortfall, guardrail, lifetime-tax, and after-tax-estate tradeoffs.
+- Jointly solve bracket-fill actions with current-year spending and
+  tax-funding withdrawals so the final return honors the configured ceiling
+  whenever forced income alone does not exceed it.
+- Preserve non-worsening gain harvests when forced ordinary income already
+  exceeds a conversion target, and include RMDs in scheduled tax-deferred
+  withdrawal actions.
+- Include tax-strategy searches and action state in planner compute, memory,
+  request-body, and aggregate admission limits.
+- Advance planner result, reproducibility-manifest, simulation-engine, and
+  scenario-comparison schemas for replayable strategy actions.
+- Apply spousal, survivor, RIB-LIM, earnings-test adjustment, and
+  married-to-single tax transitions with versioned policy manifests.
+- Persist resolved starting-portfolio valuation provenance and progressive-tax
+  policy fingerprints in claiming-optimization replay manifests.
+- Integrate tax-strategy projections with owner-keyed accounts while retaining
+  owner-preserving Roth conversions, proportional withdrawal semantics, and
+  conservative planner admission.
+
+### Tests
+- Add deterministic conversion-bound, gain-basis, proportional-fallback,
+  no-future-path, replay, IRMAA-lookback, comparison, CLI/API, body-limit,
+  manifest, and resource-accounting coverage.
+- Add deterministic zero-PIA spouse, entitlement-onset, survivor RIB-LIM,
+  pre-claim death, benefit-specific earnings-test, owner-isolation, dynamic
+  filing, claiming-matrix, and household replay coverage.
 
 ## 0.6.0 - 2026-07-30
 

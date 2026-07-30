@@ -11,10 +11,16 @@ import platform
 from typing import TYPE_CHECKING
 
 from ynab_agent.planning.historical import HistoricalSeries
+from ynab_agent.planning.household import (
+    HouseholdState,
+    estimate_household_state_bytes,
+    prepare_household_state,
+)
 from ynab_agent.planning.models import (
     CashFlowType,
     IncomeTaxTreatment,
     ReturnModel,
+    TaxTreatment,
     ValuationProvenance,
     WealthScenario,
 )
@@ -35,6 +41,7 @@ from ynab_agent.planning.paths import (
 )
 from ynab_agent.planning.progressive_tax import (
     HEALTHCARE_POLICY_PROJECTION,
+    calculate_irmaa_surcharge_arrays,
     load_tax_policy,
 )
 from ynab_agent.planning.spending_guardrails import (
@@ -45,14 +52,20 @@ from ynab_agent.planning.spending_guardrails import (
     spending_plan_manifest,
 )
 from ynab_agent.planning.taxes import TaxAwarePortfolio, estimate_tax_state_bytes
+from ynab_agent.planning.tax_strategies import tax_strategy_manifest
+from ynab_agent.planning.tax_engine import (
+    HouseholdTaxEngine,
+    household_tax_engine_for,
+)
+from ynab_agent.planning.social_security import social_security_policy_manifest
 
 if TYPE_CHECKING:
     import numpy as np
 
 
-SIMULATION_RESULT_SCHEMA_VERSION = 5
-REPRODUCIBILITY_MANIFEST_SCHEMA_VERSION = 4
-SIMULATION_ENGINE_VERSION = "wealth_simulation_v6"
+SIMULATION_RESULT_SCHEMA_VERSION = 7
+REPRODUCIBILITY_MANIFEST_SCHEMA_VERSION = 6
+SIMULATION_ENGINE_VERSION = "wealth_simulation_v8"
 _SCENARIO_CANONICALIZATION = "json_sort_keys_v1"
 
 
@@ -71,7 +84,10 @@ class SimulationResult:
     retirement_balance_real: dict[str, float]
     ending_balance_real: dict[str, float]
     lifetime_tax_real: dict[str, float] | None
+    lifetime_irmaa_surcharge_real: dict[str, float] | None
+    irmaa_exposure_probability: float | None
     annual_tax_audit: list[dict[str, object]]
+    annual_tax_strategy_actions: list[dict[str, object]]
     annual_balance_real: list[dict[str, float | int]]
     funded_spending_ratio: dict[str, float]
     funded_spending_real: dict[str, float]
@@ -85,6 +101,7 @@ class SimulationResult:
     goal_outcomes: tuple[GoalOutcome, ...]
     annual_spending_real: list[dict[str, object]]
     guardrail_metrics: dict[str, object] | None
+    household_cash_flow_audit: list[dict[str, object]]
     assumptions: dict[str, bool | float | int | str]
     engine: dict[str, str | int]
     reproducibility: dict[str, object] = field(compare=False)
@@ -120,6 +137,9 @@ class _TrialOutcomes:
     cumulative_spending_reduction_real: np.ndarray | None = None
     cumulative_spending_restoration_real: np.ndarray | None = None
     annual_tax_audit: list[dict[str, object]] = field(default_factory=list)
+    annual_tax_strategy_actions: list[dict[str, object]] = field(default_factory=list)
+    cumulative_irmaa_surcharge_real: np.ndarray | None = None
+    irmaa_exposed: np.ndarray | None = None
 
 
 @dataclass
@@ -172,6 +192,7 @@ def _tax_policy_manifest(scenario: WealthScenario) -> dict[str, object] | None:
             "ordinary_income_tax_rate": assumptions.ordinary_income_tax_rate,
             "long_term_capital_gains_tax_rate": (assumptions.long_term_capital_gains_tax_rate),
             "social_security_taxable_fraction": (assumptions.social_security_taxable_fraction),
+            "strategy": tax_strategy_manifest(assumptions.strategy),
         }
     policy, digest = load_tax_policy()
     progressive = assumptions.progressive
@@ -191,8 +212,12 @@ def _tax_policy_manifest(scenario: WealthScenario) -> dict[str, object] | None:
         },
         "irmaa_hook": {
             "lookback_years": 2,
-            "historical_magi_years": [value.tax_year for value in progressive.irmaa_lookback_magi],
+            "historical_magi": [
+                value.model_dump(mode="json")
+                for value in progressive.irmaa_lookback_magi
+            ],
         },
+        "strategy": tax_strategy_manifest(assumptions.strategy),
         "healthcare_policy_projection": {
             "mode": HEALTHCARE_POLICY_PROJECTION,
             "healthcare_inflation_rate_applied": False,
@@ -409,6 +434,7 @@ def _record_guardrail_decision(
     decision: GuardrailBatchDecision,
     *,
     baseline_total: float,
+    spending_scale: float | np.ndarray = 1.0,
 ) -> None:
     import numpy as np
 
@@ -422,11 +448,11 @@ def _record_guardrail_decision(
     state.restoration_events[trial_slice] += decision.action == 1
     state.cumulative_reduction_real[trial_slice] += np.maximum(
         0.0,
-        baseline_total - decision.applied_total_real,
+        (baseline_total - decision.applied_total_real) * spending_scale,
     )
     state.cumulative_restoration_real[trial_slice] += np.maximum(
         0.0,
-        decision.applied_total_real - previous,
+        (decision.applied_total_real - previous) * spending_scale,
     )
 
 
@@ -449,6 +475,7 @@ def _run_blended_trial_outcomes(
         ]
         | None
     ) = None,
+    household_state: HouseholdState | None = None,
 ) -> _TrialOutcomes:
     """Evolve trial balances without computing report statistics."""
     try:
@@ -539,10 +566,17 @@ def _run_blended_trial_outcomes(
                 batch_balances += contribution
             else:
                 if spending_plan is not None and guardrail_state is not None:
+                    spending_scale = (
+                        household_state.spending_fraction[offset, trial_slice]
+                        if household_state is not None
+                        else 1.0
+                    )
                     decision = evaluate_guardrail_batch(
                         spending_plan,
                         opening_portfolio_real=(
-                            batch_balances / inflation_factor
+                            batch_balances
+                            / inflation_factor
+                            / np.where(spending_scale > 0, spending_scale, 1.0)
                         ),
                         previous_total_real=(
                             guardrail_state.current_total_real[trial_slice]
@@ -553,6 +587,7 @@ def _run_blended_trial_outcomes(
                         trial_slice,
                         decision,
                         baseline_total=spending_plan.baseline.total,
+                        spending_scale=spending_scale,
                     )
                     if (
                         annual_action is None
@@ -572,6 +607,11 @@ def _run_blended_trial_outcomes(
                     spending = (
                         scenario.annual_spending * inflation_factor
                     )
+                if household_state is not None:
+                    spending = (
+                        spending
+                        * household_state.spending_fraction[offset, trial_slice]
+                    )
                 for cash_flow in scenario.cash_flow_streams:
                     if cash_flow.flow_type is not CashFlowType.EXPENSE:
                         continue
@@ -584,6 +624,14 @@ def _run_blended_trial_outcomes(
                         expense_amount = expense_amount * inflation_factor
                     spending = spending + expense_amount
                 income: float | np.ndarray = 0.0
+                if household_state is not None:
+                    income = (
+                        household_state.ordinary_income[offset, trial_slice]
+                        + household_state.social_security_income[
+                            offset, trial_slice
+                        ]
+                        + household_state.tax_free_income[offset, trial_slice]
+                    )
                 for income_stream in scenario.income_streams:
                     if age < income_stream.start_age:
                         continue
@@ -608,6 +656,20 @@ def _run_blended_trial_outcomes(
                         required_real=spending / inflation_factor,
                         shortfall_real=shortfall / inflation_factor,
                         failed=failed,
+                        active=(
+                            household_state.household_alive[
+                                offset, trial_slice
+                            ]
+                            if household_state is not None
+                            else True
+                        ),
+                        spending_scale=(
+                            household_state.spending_fraction[
+                                offset, trial_slice
+                            ]
+                            if household_state is not None
+                            else 1.0
+                        ),
                     )
                 np.maximum(
                     0.0,
@@ -684,6 +746,8 @@ def _run_tax_aware_trial_outcomes(
         ]
         | None
     ) = None,
+    household_state: HouseholdState | None = None,
+    tax_engine: HouseholdTaxEngine | None = None,
 ) -> _TrialOutcomes:
     """Evolve explicit tax buckets with account-aware retirement withdrawals."""
     try:
@@ -738,8 +802,11 @@ def _run_tax_aware_trial_outcomes(
     )
     batches = tuple(trial_slices)
     annual_tax_audit: list[dict[str, object]] = []
+    annual_tax_strategy_actions: list[dict[str, object]] = []
+    simulated_magi_by_year: dict[int, np.ndarray] = {}
     for offset in range(years):
         age = scenario.current_age + offset
+        portfolio.reset_annual_audit()
         annual_action = (
             np.zeros(scenario.trials, dtype=np.int8)
             if age >= scenario.retirement_age
@@ -793,11 +860,17 @@ def _run_tax_aware_trial_outcomes(
                     )
             else:
                 if spending_plan is not None and guardrail_state is not None:
+                    spending_scale = (
+                        household_state.spending_fraction[offset, trial_slice]
+                        if household_state is not None
+                        else 1.0
+                    )
                     decision = evaluate_guardrail_batch(
                         spending_plan,
                         opening_portfolio_real=(
                             portfolio.total(trial_slice)
                             / inflation_factor
+                            / np.where(spending_scale > 0, spending_scale, 1.0)
                         ),
                         previous_total_real=(
                             guardrail_state.current_total_real[trial_slice]
@@ -808,6 +881,7 @@ def _run_tax_aware_trial_outcomes(
                         trial_slice,
                         decision,
                         baseline_total=spending_plan.baseline.total,
+                        spending_scale=spending_scale,
                     )
                     if (
                         annual_action is None
@@ -827,6 +901,11 @@ def _run_tax_aware_trial_outcomes(
                     spending = (
                         scenario.annual_spending * inflation_factor
                     )
+                if household_state is not None:
+                    spending = (
+                        spending
+                        * household_state.spending_fraction[offset, trial_slice]
+                    )
                 for cash_flow in scenario.cash_flow_streams:
                     if cash_flow.flow_type is not CashFlowType.EXPENSE:
                         continue
@@ -842,6 +921,18 @@ def _run_tax_aware_trial_outcomes(
                 ordinary_income: float | np.ndarray = 0.0
                 social_security_income: float | np.ndarray = 0.0
                 tax_free_income: float | np.ndarray = 0.0
+                if household_state is not None:
+                    ordinary_income = household_state.ordinary_income[
+                        offset, trial_slice
+                    ]
+                    social_security_income = (
+                        household_state.social_security_income[
+                            offset, trial_slice
+                        ]
+                    )
+                    tax_free_income = household_state.tax_free_income[
+                        offset, trial_slice
+                    ]
                 for income_stream in scenario.income_streams:
                     if age < income_stream.start_age:
                         continue
@@ -874,6 +965,20 @@ def _run_tax_aware_trial_outcomes(
                     opening_tax_deferred=opening_tax_deferred,
                     inflation_factor=inflation_factor,
                     assumptions=scenario.tax_assumptions,
+                    joint_filing=(
+                        household_state.joint_filing[offset, trial_slice]
+                        if household_state is not None
+                        else None
+                    ),
+                    tax_engine=tax_engine,
+                    owner_birth_years=(
+                        {
+                            person.id: person.birth_date.year
+                            for person in scenario.household.people
+                        }
+                        if scenario.household is not None
+                        else None
+                    ),
                 )
                 batch_depletion_ages = depletion_ages[trial_slice]
                 failed = unmet > 0.005
@@ -885,15 +990,79 @@ def _run_tax_aware_trial_outcomes(
                         required_real=spending / inflation_factor,
                         shortfall_real=unmet / inflation_factor,
                         failed=failed,
+                        active=(
+                            household_state.household_alive[
+                                offset, trial_slice
+                            ]
+                            if household_state is not None
+                            else True
+                        ),
+                        spending_scale=(
+                            household_state.spending_fraction[
+                                offset, trial_slice
+                            ]
+                            if household_state is not None
+                            else 1.0
+                        ),
                     )
 
-        if age >= scenario.retirement_age and scenario.tax_assumptions.progressive is not None:
+        owner_flows = (
+            [
+                {
+                    "owner_person_id": key.owner_person_id,
+                    "tax_treatment": key.tax_treatment.value,
+                    "required_minimum_distribution_nominal": (
+                        _percentiles(portfolio.annual_rmd_nominal[key])
+                    ),
+                    "withdrawal_nominal": _percentiles(
+                        portfolio.annual_withdrawal_nominal[key]
+                    ),
+                }
+                for key in portfolio.balances
+            ]
+            if age >= scenario.retirement_age
+            else []
+        )
+        if (
+            age >= scenario.retirement_age
+            and scenario.tax_assumptions.progressive is not None
+        ):
+            progressive = scenario.tax_assumptions.progressive
+            tax_year = progressive.simulation_start_year + offset
+            lookback_year = tax_year - 2
+            lookback_magi: float | np.ndarray | None = simulated_magi_by_year.get(
+                lookback_year
+            )
+            if lookback_magi is None:
+                lookback_magi = next(
+                    (
+                        value.magi
+                        for value in progressive.irmaa_lookback_magi
+                        if value.tax_year == lookback_year
+                    ),
+                    None,
+                )
+            surcharge = np.broadcast_to(
+                calculate_irmaa_surcharge_arrays(
+                    progressive,
+                    tax_year=tax_year,
+                    lookback_magi=lookback_magi,
+                ),
+                (scenario.trials,),
+            ).astype(float, copy=True)
+            portfolio.annual_irmaa_surcharge_nominal[:] = surcharge
+            portfolio.cumulative_irmaa_surcharge_real += (
+                surcharge / paths.inflation_factors[offset]
+            )
+            portfolio.irmaa_exposed |= surcharge > 0
+            simulated_magi_by_year[tax_year] = (
+                portfolio.annual_modified_adjusted_gross_income_nominal.copy()
+            )
             annual_tax_audit.append(
                 {
-                    "tax_year": (
-                        scenario.tax_assumptions.progressive.simulation_start_year + offset
-                    ),
+                    "tax_year": tax_year,
                     "age": age,
+                    "owner_flows": owner_flows,
                     "total_income_tax_nominal": _percentiles(portfolio.annual_tax_nominal),
                     "federal_income_tax_nominal": _percentiles(
                         portfolio.annual_federal_tax_nominal
@@ -911,6 +1080,12 @@ def _run_tax_aware_trial_outcomes(
                     "early_distribution_penalty_nominal": _percentiles(
                         portfolio.annual_early_distribution_penalty_nominal
                     ),
+                    "modified_adjusted_gross_income_nominal": _percentiles(
+                        portfolio.annual_modified_adjusted_gross_income_nominal
+                    ),
+                    "irmaa_annual_surcharge_nominal": _percentiles(
+                        portfolio.annual_irmaa_surcharge_nominal
+                    ),
                     "effective_income_tax_rate": _percentiles(portfolio.annual_effective_rate),
                     "marginal_ordinary_income_tax_rate": _percentiles(
                         portfolio.annual_marginal_ordinary_rate
@@ -918,6 +1093,55 @@ def _run_tax_aware_trial_outcomes(
                     "marginal_long_term_capital_gains_tax_rate": _percentiles(
                         portfolio.annual_marginal_ltcg_rate
                     ),
+                }
+            )
+        elif age >= scenario.retirement_age:
+            annual_tax_audit.append(
+                {
+                    "tax_year": 2026 + offset,
+                    "age": age,
+                    "owner_flows": owner_flows,
+                }
+            )
+        if (
+            age >= scenario.retirement_age
+            and scenario.tax_assumptions.strategy is not None
+        ):
+            aggregate_withdrawals: dict[str, dict[str, float]] = {}
+            for treatment in TaxTreatment:
+                keys = [
+                    key
+                    for key in portfolio.balances
+                    if key.tax_treatment is treatment
+                ]
+                if not keys:
+                    continue
+                values = np.zeros(scenario.trials, dtype=float)
+                for key in keys:
+                    values += portfolio.annual_withdrawal_nominal[key]
+                    values += portfolio.annual_rmd_nominal[key]
+                aggregate_withdrawals[treatment.value] = _percentiles(
+                    values
+                )
+            annual_tax_strategy_actions.append(
+                {
+                    "schema_version": 1,
+                    "policy_id": scenario.tax_assumptions.strategy.policy_id,
+                    "tax_year": (
+                        scenario.tax_assumptions.progressive.simulation_start_year
+                        + offset
+                        if scenario.tax_assumptions.progressive is not None
+                        else 2026 + offset
+                    ),
+                    "age": age,
+                    "decision_information": "current_year_only",
+                    "roth_conversion_nominal": _percentiles(
+                        portfolio.annual_roth_conversion_nominal
+                    ),
+                    "harvested_long_term_capital_gains_nominal": _percentiles(
+                        portfolio.annual_harvested_long_term_capital_gains_nominal
+                    ),
+                    "withdrawals_nominal": aggregate_withdrawals,
                 }
             )
         total_balances = portfolio.total(slice(0, scenario.trials))
@@ -951,6 +1175,11 @@ def _run_tax_aware_trial_outcomes(
             if scenario.tax_assumptions.progressive is not None
             else 2026 + years
         ),
+        joint_filing=(
+            household_state.joint_filing[-1]
+            if household_state is not None
+            else None
+        ),
     )
     return _TrialOutcomes(
         ending_balances=portfolio.total(slice(0, scenario.trials)),
@@ -979,6 +1208,17 @@ def _run_tax_aware_trial_outcomes(
             else None
         ),
         annual_tax_audit=annual_tax_audit,
+        annual_tax_strategy_actions=annual_tax_strategy_actions,
+        cumulative_irmaa_surcharge_real=(
+            portfolio.cumulative_irmaa_surcharge_real
+            if scenario.tax_assumptions.progressive is not None
+            else None
+        ),
+        irmaa_exposed=(
+            portfolio.irmaa_exposed
+            if scenario.tax_assumptions.progressive is not None
+            else None
+        ),
     )
 
 
@@ -1001,6 +1241,8 @@ def _run_trial_outcomes(
         ]
         | None
     ) = None,
+    household_state: HouseholdState | None = None,
+    tax_engine: HouseholdTaxEngine | None = None,
 ) -> _TrialOutcomes:
     if scenario.tax_buckets:
         return _run_tax_aware_trial_outcomes(
@@ -1010,6 +1252,8 @@ def _run_trial_outcomes(
             annual_observer=annual_observer,
             outcome_accumulator=outcome_accumulator,
             spending_observer=spending_observer,
+            household_state=household_state,
+            tax_engine=tax_engine,
         )
     return _run_blended_trial_outcomes(
         scenario,
@@ -1018,6 +1262,7 @@ def _run_trial_outcomes(
         annual_observer=annual_observer,
         outcome_accumulator=outcome_accumulator,
         spending_observer=spending_observer,
+        household_state=household_state,
     )
 
 
@@ -1030,6 +1275,8 @@ def score_simulation(
     prepared_paths: SimulationPaths | None = None,
     path_source: PathSource | BoundedPathSource | None = None,
     run_policy: RunPolicy | None = None,
+    prepared_household_state: HouseholdState | None = None,
+    tax_engine: HouseholdTaxEngine | None = None,
 ) -> SimulationScore:
     """Evaluate success without percentiles, confidence intervals, or report metadata."""
     try:
@@ -1051,10 +1298,16 @@ def score_simulation(
         run_policy=run_policy,
     )
     try:
+        household_state = prepared_household_state or prepare_household_state(
+            scenario,
+            inflation_factors=paths.inflation_factors,
+        )
         outcomes = _run_trial_outcomes(
             scenario,
             starting_portfolio,
             paths=paths,
+            household_state=household_state,
+            tax_engine=tax_engine,
         )
         depleted = int(np.count_nonzero(~np.isnan(outcomes.depletion_ages)))
         return SimulationScore(
@@ -1081,6 +1334,8 @@ def simulate(
     include_annual_path: bool = True,
     path_source: PathSource | BoundedPathSource | None = None,
     run_policy: RunPolicy | None = None,
+    prepared_household_state: HouseholdState | None = None,
+    tax_engine: HouseholdTaxEngine | None = None,
 ) -> SimulationResult:
     """Run a seeded parametric or historical-bootstrap retirement simulation."""
     try:
@@ -1140,6 +1395,7 @@ def simulate(
             if scenario.retirement_spending_plan is not None
             else 0
         )
+        + estimate_household_state_bytes(scenario)
     )
     evaluation_reservation = None
     try:
@@ -1165,7 +1421,6 @@ def simulate(
             annual_balance_real.append({"age": age, **_percentiles(real_balances)})
 
         outcome_accumulator = OutcomeAccumulator(scenario)
-
         def observe_annual_spending(
             age: int,
             state: _GuardrailTrialState,
@@ -1175,6 +1430,11 @@ def simulate(
             import numpy as np
 
             finite_rates = withdrawal_rate[np.isfinite(withdrawal_rate)]
+            spending_scale = (
+                household_state.spending_fraction[age - scenario.current_age]
+                if household_state is not None
+                else 1.0
+            )
             annual_spending_real.append(
                 {
                     "age": age,
@@ -1184,13 +1444,21 @@ def simulate(
                     "reduced_trials": int(np.count_nonzero(action == -1)),
                     "restored_trials": int(np.count_nonzero(action == 1)),
                     "held_trials": int(np.count_nonzero(action == 0)),
-                    "total": _percentiles(state.current_total_real),
-                    "essential": _percentiles(state.essential_real),
-                    "lifestyle": _percentiles(state.lifestyle_real),
-                    "discretionary": _percentiles(
-                        state.discretionary_real
+                    "total": _percentiles(
+                        state.current_total_real * spending_scale
                     ),
-                    "one_time": _percentiles(state.one_time_real),
+                    "essential": _percentiles(
+                        state.essential_real * spending_scale
+                    ),
+                    "lifestyle": _percentiles(
+                        state.lifestyle_real * spending_scale
+                    ),
+                    "discretionary": _percentiles(
+                        state.discretionary_real * spending_scale
+                    ),
+                    "one_time": _percentiles(
+                        state.one_time_real * spending_scale
+                    ),
                     "withdrawal_rate": (
                         _percentiles(finite_rates)
                         if finite_rates.size
@@ -1203,7 +1471,10 @@ def simulate(
                     ),
                 }
             )
-
+        household_state = prepared_household_state or prepare_household_state(
+            scenario,
+            inflation_factors=paths.inflation_factors,
+        )
         outcomes = _run_trial_outcomes(
             scenario,
             starting_portfolio,
@@ -1216,6 +1487,8 @@ def simulate(
                 and scenario.retirement_spending_plan is not None
                 else None
             ),
+            household_state=household_state,
+            tax_engine=tax_engine,
         )
         depleted = int(np.count_nonzero(~np.isnan(outcomes.depletion_ages)))
         finite_depletion_ages = outcomes.depletion_ages[~np.isnan(outcomes.depletion_ages)]
@@ -1332,7 +1605,18 @@ def simulate(
                 if outcomes.cumulative_tax_real is not None
                 else None
             ),
+            lifetime_irmaa_surcharge_real=(
+                _percentiles(outcomes.cumulative_irmaa_surcharge_real)
+                if outcomes.cumulative_irmaa_surcharge_real is not None
+                else None
+            ),
+            irmaa_exposure_probability=(
+                float(np.mean(outcomes.irmaa_exposed))
+                if outcomes.irmaa_exposed is not None
+                else None
+            ),
             annual_tax_audit=outcomes.annual_tax_audit,
+            annual_tax_strategy_actions=outcomes.annual_tax_strategy_actions,
             annual_balance_real=annual_balance_real,
             funded_spending_ratio=outcome_summary.funded_spending_ratio,
             funded_spending_real=outcome_summary.funded_spending_real,
@@ -1346,6 +1630,9 @@ def simulate(
             goal_outcomes=outcome_summary.goal_outcomes,
             annual_spending_real=annual_spending_real,
             guardrail_metrics=guardrail_metrics,
+            household_cash_flow_audit=(
+                household_state.audit if household_state is not None else []
+            ),
             assumptions={
                 "current_age": scenario.current_age,
                 "retirement_age": scenario.retirement_age,
@@ -1391,11 +1678,22 @@ def simulate(
                     else "blended_withdrawal_rate"
                 ),
                 "tax_bucket_count": len(scenario.tax_buckets),
+                "tax_strategy_policy": (
+                    scenario.tax_assumptions.strategy.policy_id
+                    if scenario.tax_assumptions is not None
+                    and scenario.tax_assumptions.strategy is not None
+                    else "not_configured"
+                ),
                 "spending_tier_count": len(scenario.spending_tiers),
                 "legacy_target_real": (
                     scenario.legacy_target_real
                     if scenario.legacy_target_real is not None
                     else "not_configured"
+                ),
+                "household_people": (
+                    len(scenario.household.people)
+                    if scenario.household is not None
+                    else 0
                 ),
                 **(
                     {
@@ -1468,6 +1766,44 @@ def simulate(
                 ),
                 "outcome_semantics": outcome_semantics_manifest(),
                 "tax_policy": _tax_policy_manifest(scenario),
+                "household": (
+                    {
+                        "cash_flow_audit": "per-person annual real-dollar percentiles",
+                        "longevity": (
+                            "seeded_correlated_bounded_normal_or_deterministic_v1"
+                        ),
+                        "longevity_random": {
+                            "substream": "household_longevity_v1",
+                            "seed_derivation": "scenario_seed_xor_constant",
+                            "seed_xor_hex": "0x535341",
+                            "draw_policy": (
+                                "one standard-normal draw per person and trial; "
+                                "second-person correlation applied after draw"
+                            ),
+                        },
+                        "assets_after_death": "remain_in_household_portfolio",
+                        "pre_retirement_household_income": (
+                            "audit_only_unless_an_explicit_cash_flow_contributes_it"
+                        ),
+                        "post_death_outcomes": (
+                            "inactive_for_recovery_and_spending_tier_attainment"
+                        ),
+                        "survivor_spending_tiers": (
+                            "scaled_by_survivor_spending_fraction"
+                        ),
+                        "tax_engine_port": (
+                            household_tax_engine_for(
+                                scenario.tax_assumptions,
+                                tax_engine,
+                            ).engine_id
+                            if scenario.tax_assumptions is not None
+                            else "not_used"
+                        ),
+                        "social_security": social_security_policy_manifest(),
+                    }
+                    if scenario.household is not None
+                    else None
+                ),
                 "valuation": (
                     valuation_provenance.model_dump(mode="json")
                     if valuation_provenance is not None

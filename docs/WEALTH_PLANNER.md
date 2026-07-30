@@ -185,6 +185,77 @@ GET  /wealth/spending-tiers?budget_id=...
 GET  /wealth/spending-baseline?budget_id=...&through_month=2026-08-01
 POST /wealth/spending-guardrails/preview
 ```
+## Household and Social Security claiming
+
+Use the optional `household` input for one or two people. The first person's
+age on `plan_start_date` must equal the scenario `current_age`. Each person has
+a birth date, retirement age in months, SSA primary insurance amount (PIA),
+claim age in months, independent work and pension timelines, and deterministic
+or bounded probabilistic longevity. See
+`examples/wealth-household.example.json` for a complete tax-aware couple.
+An omitted claim age means no retirement benefit is paid in a normal
+simulation; the optimizer supplies each candidate claim age itself.
+
+Compare whole-year claiming ages from 62 through 70:
+
+```bash
+ynab wealth optimize-social-security \
+  --scenario household.local.json
+ynab wealth optimize-social-security \
+  --scenario household.local.json \
+  --json
+```
+
+The matrix is bounded to 81 strategies for a couple and reuses identical
+market paths and seeded longevity assumptions. Ranking is lexicographic:
+household success rate, median funded spending, then median after-tax ending
+portfolio. Explicit tax buckets and tax assumptions are therefore required.
+It deliberately does not maximize raw cumulative benefits.
+The optimizer currently accepts the parametric `lognormal` return model; a
+historical comparison needs a future registered/prepared-experiment entry
+point.
+
+The API exposes the same bounded operation at
+`POST /wealth/social-security/optimize`. Regular simulation and durable planner
+results include `household_cash_flow_audit`, with annual per-person real-dollar
+P10/P50/P90 work, pension, own/spousal/survivor Social Security, earnings-test
+withholding, fully withheld-month credits and FRA benefit recomputation, total
+paid benefits, alive status, and filing-status probabilities. The
+reproducibility manifest records the policy snapshot, official sources,
+longevity method, resource estimate, and tax-engine port.
+
+Modeled SSA rules include monthly early and delayed retirement adjustments,
+FRA by birth year, spouse and survivor reductions, deemed filing for own and
+spouse benefits, the 2026 earnings test, and the 2026 family maximum. Primary
+sources:
+
+- [SSA retirement claiming ages](https://www.ssa.gov/benefits/retirement/planner/applying2.html)
+- [SSA full retirement age table](https://www.ssa.gov/oact/progdata/nra.html)
+- [SSA early/delayed adjustment formulas](https://www.ssa.gov/policy/docs/statcomps/supplement/2025/apnc.html)
+- [SSA spouse reduction formulas](https://www.ssa.gov/OP_Home/handbook/handbook.07/handbook-0724.html)
+- [SSA spouse benefit rules](https://www.ssa.gov/blog/en/posts/2024-07-11.html)
+- [SSA survivor benefit amounts](https://www.ssa.gov/survivor/amount)
+- [SSA 2026 earnings-test limits](https://www.ssa.gov/cola/factsheets/2026.html)
+- [SSA earnings-test crediting months](https://secure.ssa.gov/poms.nsf/lnx/0302501021)
+- [SSA family-maximum formula](https://www.ssa.gov/oact/COLA/familymax.html)
+
+This is a household portfolio comparison, not an SSA entitlement
+determination. It does not model disability/dependent benefits,
+government-pension offsets, partial calendar-year claiming, grace-year monthly
+tests, or future policy changes. At FRA it recomputes retirement and spousal
+reductions for months with full or partial work deductions. Probabilistic longevity uses a
+seeded bounded correlated-normal sensitivity rather than actuarial mortality
+tables. Assets remain in the household portfolio after a death. Years after the
+last household death are inactive for recovery and spending-tier evaluation;
+survivor tier targets scale with survivor spending. Progressive scenarios apply
+married-filing-jointly rules while both spouses live and single-filer rules
+after a survivor transition for income, withdrawals, and terminal liquidation. Account
+ownership is retained for owner-specific distribution work in issue #94.
+`retirement_age_months` is an audited milestone; explicit work and pension
+timelines determine each person's cash-flow dates. Pension and Social Security
+received before the scenario retirement milestone are audited but are not
+automatically invested. Model those savings with an explicit contribution
+cash-flow stream.
 
 ## Age-bounded cash flows and mortgage payoff
 
@@ -340,10 +411,97 @@ credit hooks, and the two-year Medicare IRMAA lookback tier and surcharge.
 ACA credits and Medicare premiums are audit fields only until the separate
 healthcare-premium cash-flow model consumes them.
 
+### Tax-strategy comparisons
+
+Add a versioned `strategy` to `tax_assumptions` to compare implementable
+current-year rules:
+
+```json
+{
+  "strategy": {
+    "policy_id": "tax_strategy_v1",
+    "withdrawal_policy": "proportional",
+    "proportional_withdrawal_fractions": [
+      {"tax_treatment": "taxable", "fraction": 0.4},
+      {"tax_treatment": "tax_deferred", "fraction": 0.3},
+      {"tax_treatment": "roth", "fraction": 0.3}
+    ],
+    "roth_conversion": {
+      "policy_id": "roth_bracket_fill_v1",
+      "start_age": 60,
+      "end_age": 67,
+      "target_federal_ordinary_bracket_rate": 0.12,
+      "max_annual_conversion_real": 50000
+    },
+    "capital_gain_harvest": {
+      "policy_id": "capital_gain_bracket_fill_v1",
+      "start_age": 60,
+      "end_age": 67,
+      "target_federal_long_term_capital_gains_rate": 0,
+      "max_annual_gain_real": 25000
+    },
+    "asset_location_preferences": [
+      {
+        "asset_class": "bonds",
+        "preferred_tax_treatments": ["tax_deferred"]
+      }
+    ]
+  }
+}
+```
+
+The proportional fractions describe target shares of the annual net cash
+need. If one treatment cannot fund its share, the configured
+`withdrawal_order` deterministically supplies the remainder. Proportional
+withdrawals work with either tax engine. Roth conversion and gain-harvest
+rules require `progressive_us_indiana`, matching tax-deferred and Roth
+buckets for conversions and a taxable bucket with basis for harvesting.
+
+Each annual rule sees only the current tax year, current income, current
+account balances and basis, the current-year return already observed, and the
+versioned tax policy. It jointly projects the configured current-year cash
+need and withdrawal policy so the final return, including withdrawals used to
+fund an action's tax, remains inside the selected bracket when forced income
+alone permits it. If forced income or an RMD already exceeds an active
+conversion target, gain harvesting may continue only while it does not worsen
+the baseline ordinary-income position. It never reads a future return path.
+Conversion and harvest caps are today's dollars and scale with the
+simulation's inflation path. Gain harvesting models a sell-and-repurchase
+basis reset; any resulting tax is funded through the configured withdrawal
+policy. The asset-location list is a typed, manifested advisory hook until the
+multi-asset engine consumes it.
+
+Simulation output includes `annual_tax_strategy_actions` with P10/P50/P90
+conversion, gain-harvest, and per-treatment withdrawal amounts. It also
+includes required minimum distributions in the tax-deferred withdrawal total.
+It also reports annual IRMAA surcharges from the two-year MAGI lookback, real
+lifetime IRMAA surcharge, and exposure probability. IRMAA remains an audit
+outcome, not a healthcare-premium cash flow.
+
+For human review:
+
+```bash
+ynab wealth tax-strategy --scenario conversion.local.json
+```
+
+The authenticated `POST /wealth/tax/strategies/jobs` route accepts the same
+planner-job body as `POST /planner/jobs` and returns the standard durable job
+URLs. It shares queue, process, memory, body-size, and compute admission with
+all other planner work.
+
+To compare benefits and tradeoffs, save a baseline and each strategy as
+immutable scenario revisions, then run `ynab wealth scenarios compare`.
+Common-path results classify strategy inputs as tax policy and report
+lifetime taxes, funded spending, shortfalls, guardrail concessions, IRMAA
+exposure, and after-tax estate deltas. The stored scenario, policy IDs,
+complete strategy recipe, engine identity, and common-path manifest make the
+recommendation replayable.
+
 This remains a retirement-planning engine, not tax preparation software. It
 does not model itemized deductions, NIIT, AMT, tax-loss harvesting, Roth
-conversions, qualified charitable distributions, local Indiana income tax, or
-the joint-life RMD exception. Birth-year age tests use calendar-year age; the
+conversion seasoning, qualified charitable distributions, local Indiana
+income tax, or the joint-life RMD exception. Birth-year age tests use
+calendar-year age; the
 pre-1949 70½ rule is represented as age 70. The effective-rate engine remains
 useful for sensitivity analysis and for households outside the progressive
 policy's supported jurisdiction.
@@ -549,8 +707,8 @@ Important limitations:
 - YNAB has account balances, not security holdings or asset allocation.
 - YNAB investment tracking does not distinguish market gains from
   reconciliation adjustments.
-- Social Security and pension amounts should come from an authoritative
-  personal estimate and be entered as scenario inputs.
+- Social Security PIAs and pension amounts should come from authoritative
+  personal estimates.
 
 Natural next steps are periodic balance snapshots, side-by-side scenario
 comparison, asset-class allocations and covariance, longevity sampling,

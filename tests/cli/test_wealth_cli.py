@@ -154,6 +154,108 @@ def test_wealth_tax_uses_domain_calculator(tmp_path: Path) -> None:
     assert payload["policy_manifest"]["policy_id"] == "us_in_2026_v1"
 
 
+def test_tax_strategy_cli_matches_simulation_json_and_prints_schedule(
+    tmp_path: Path,
+) -> None:
+    scenario = WealthScenario.model_validate(
+        {
+            "name": "CLI strategy",
+            "current_age": 60,
+            "retirement_age": 60,
+            "end_age": 63,
+            "starting_portfolio": 100_000,
+            "annual_spending": 10_000,
+            "inflation_rate": 0,
+            "return_mean": 0,
+            "return_volatility": 0,
+            "annual_fee_rate": 0,
+            "trials": 100,
+            "seed": 92,
+            "tax_buckets": [
+                {"tax_treatment": "tax_deferred", "starting_balance": 70_000},
+                {"tax_treatment": "roth", "starting_balance": 20_000},
+                {
+                    "tax_treatment": "taxable",
+                    "starting_balance": 10_000,
+                    "taxable_basis": 5_000,
+                },
+            ],
+            "tax_assumptions": {
+                "ordinary_income_tax_rate": 0,
+                "long_term_capital_gains_tax_rate": 0,
+                "tax_model": "progressive_us_indiana",
+                "progressive": {
+                    "filing_status": "single",
+                    "simulation_start_year": 2026,
+                    "taxpayer_birth_year": 1966,
+                },
+                "apply_required_minimum_distributions": False,
+                "withdrawal_order": ["taxable", "tax_deferred", "roth"],
+                "retirement_surplus_destination": "taxable",
+                "strategy": {
+                    "withdrawal_policy": "ordered",
+                    "roth_conversion": {
+                        "start_age": 60,
+                        "end_age": 61,
+                        "target_federal_ordinary_bracket_rate": 0.10,
+                        "max_annual_conversion_real": 20_000,
+                    },
+                },
+            },
+        }
+    )
+    scenario_path = tmp_path / "strategy.local.json"
+    scenario_path.write_text(scenario.model_dump_json(), encoding="utf-8")
+
+    strategy_json = runner.invoke(
+        app,
+        [
+            "wealth",
+            "tax-strategy",
+            "--scenario",
+            str(scenario_path),
+            "--json",
+        ],
+    )
+    simulation_json = runner.invoke(
+        app,
+        [
+            "wealth",
+            "simulate",
+            "--scenario",
+            str(scenario_path),
+            "--json",
+        ],
+    )
+    table = runner.invoke(
+        app,
+        ["wealth", "tax-strategy", "--scenario", str(scenario_path)],
+        terminal_width=500,
+    )
+
+    assert strategy_json.exit_code == 0, strategy_json.output
+    assert simulation_json.exit_code == 0, simulation_json.output
+    assert json.loads(strategy_json.output) == json.loads(simulation_json.output)
+    payload = json.loads(strategy_json.output)
+    assert payload["annual_tax_strategy_actions"][0]["policy_id"] == (
+        "tax_strategy_v1"
+    )
+    assert table.exit_code == 0, table.output
+    assert "Roth Conversion" in table.output
+    assert "Tax Treatment" in table.output
+    assert "tax_deferred" in table.output
+    assert "roth" in table.output
+    assert "taxable" in table.output
+    assert "hsa" in table.output
+    assert "cash" in table.output
+    first_withdrawals = payload["annual_tax_strategy_actions"][0][
+        "withdrawals_nominal"
+    ]
+    assert format(first_withdrawals["taxable"]["p50"], ",.2f") in table.output
+    assert "IRMAA" in table.output
+    assert "After-Tax" in table.output
+
+
 def test_cli_resolves_only_liquid_accounts(monkeypatch, tmp_path) -> None:
     database_url = f"sqlite+aiosqlite:///{tmp_path / 'wealth.db'}"
 

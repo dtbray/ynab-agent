@@ -19,7 +19,14 @@ from ynab_agent.planning.historical import (
     HistoricalOrderPolicy,
     HistoricalSeries,
 )
-from ynab_agent.planning.models import ReturnModel, ValuationProvenance, WealthScenario
+from ynab_agent.planning.household import estimate_household_state_bytes
+from ynab_agent.planning.models import (
+    ReturnModel,
+    TaxTreatment,
+    ValuationProvenance,
+    WealthScenario,
+    WithdrawalPolicy,
+)
 from ynab_agent.planning.outcomes import (
     GoalKind,
     estimate_outcome_state_bytes,
@@ -44,10 +51,11 @@ from ynab_agent.planning.taxes import (
     PROGRESSIVE_TAX_EVALUATIONS_PER_BUCKET,
     estimate_tax_state_bytes,
 )
+from ynab_agent.planning.tax_strategies import TAX_STRATEGY_EVALUATIONS_PER_YEAR
 from ynab_agent.services.wealth import WealthService
 
 
-PLANNER_JOB_REQUEST_SCHEMA_VERSION = 3
+PLANNER_JOB_REQUEST_SCHEMA_VERSION = 4
 DEFAULT_MAXIMUM_COMPUTE_UNITS = 200_000_000
 MAX_HISTORICAL_OBSERVATIONS = 10_000
 
@@ -230,6 +238,7 @@ class PlannerExecutionPolicy(BaseModel):
                 if scenario.retirement_spending_plan is not None
                 else 0
             )
+            + estimate_household_state_bytes(scenario)
         )
         if required_bytes > self.maximum_working_bytes:
             raise ResourceLimitError(
@@ -264,8 +273,59 @@ class PlannerExecutionPolicy(BaseModel):
             for scenario in scenarios
         )
 
+    def social_security_optimization_compute_units(
+        self,
+        scenario: WealthScenario,
+        *,
+        strategy_count: int,
+    ) -> int:
+        """Account for every full simulation in a claiming-age matrix."""
+        if strategy_count <= 0:
+            raise ValueError("strategy_count must be positive")
+        compute_units = self._compute_units(scenario) * strategy_count
+        if compute_units > self.maximum_compute_units:
+            raise ResourceLimitError(
+                "estimated Social Security optimization compute work exceeds "
+                "the configured limit; reduce candidate ages, trials, horizon, "
+                "or scenario complexity"
+            )
+        return compute_units
+
+    def required_social_security_optimization_working_bytes(
+        self,
+        scenario: WealthScenario,
+        *,
+        strategy_count: int,
+    ) -> int:
+        """Bound sequential strategy evaluations sharing one path matrix."""
+        self.social_security_optimization_compute_units(
+            scenario,
+            strategy_count=strategy_count,
+        )
+        return self.required_working_bytes(
+            scenario,
+            paired_historical_inflation=False,
+        )
+
     @staticmethod
     def _compute_units(scenario: WealthScenario) -> int:
+        bucket_counts = {
+            treatment: sum(
+                bucket.tax_treatment is treatment
+                for bucket in scenario.tax_buckets
+            )
+            for treatment in {
+                bucket.tax_treatment
+                for bucket in scenario.tax_buckets
+            }
+        }
+
+        def bucket_visits(treatments: Collection[TaxTreatment]) -> int:
+            return sum(
+                bucket_counts.get(treatment, 0)
+                for treatment in treatments
+            )
+
         work_per_trial_year = (
             1
             + len(scenario.income_streams)
@@ -273,21 +333,86 @@ class PlannerExecutionPolicy(BaseModel):
             + len(scenario.tax_buckets)
             + len(scenario.spending_tiers)
             + int(scenario.retirement_spending_plan is not None)
+            + (
+                len(scenario.household.people) * 5
+                if scenario.household is not None
+                else 0
+            )
         )
+        tax_assumptions = scenario.tax_assumptions
         progressive = (
-            scenario.tax_assumptions.progressive
-            if scenario.tax_assumptions is not None
+            tax_assumptions.progressive
+            if tax_assumptions is not None
             else None
         )
+        strategy = (
+            tax_assumptions.strategy
+            if tax_assumptions is not None
+            else None
+        )
+        if (
+            strategy is not None
+            and strategy.withdrawal_policy is WithdrawalPolicy.PROPORTIONAL
+        ):
+            # One target-share pass plus the existing ordered fallback pass.
+            work_per_trial_year += len(scenario.tax_buckets)
         if progressive is not None:
+            if tax_assumptions is None:  # pragma: no cover - derived invariant
+                raise RuntimeError("progressive tax policy requires tax assumptions")
             # Every ordered bucket can require a bounded bracket search, a
             # cent-convergent bisection, and a final component calculation.
+            execution_bucket_visits = bucket_visits(
+                tax_assumptions.withdrawal_order
+            )
+            if (
+                strategy is not None
+                and strategy.withdrawal_policy
+                is WithdrawalPolicy.PROPORTIONAL
+            ):
+                execution_bucket_visits += bucket_visits(
+                    tuple(
+                        item.tax_treatment
+                        for item in strategy.proportional_withdrawal_fractions
+                    )
+                )
             work_per_trial_year += (
-                len(scenario.tax_buckets)
+                execution_bucket_visits
                 * PROGRESSIVE_TAX_EVALUATIONS_PER_BUCKET
             )
             # Baseline/final components and the two $1 marginal-rate probes.
             work_per_trial_year += 4
+            if strategy is not None and tax_assumptions is not None:
+                action_count = int(strategy.roth_conversion is not None) + int(
+                    strategy.capital_gain_harvest is not None
+                )
+                projection_bucket_visits = bucket_visits(
+                    tax_assumptions.withdrawal_order
+                )
+                if strategy.withdrawal_policy is WithdrawalPolicy.PROPORTIONAL:
+                    projection_bucket_visits += bucket_visits(
+                        tuple(
+                            item.tax_treatment
+                            for item in strategy.proportional_withdrawal_fractions
+                        )
+                    )
+                projection_work = (
+                    projection_bucket_visits
+                    * PROGRESSIVE_TAX_EVALUATIONS_PER_BUCKET
+                    + 4
+                )
+                action_projections = (
+                    action_count * TAX_STRATEGY_EVALUATIONS_PER_YEAR // 2
+                )
+                if (
+                    strategy.roth_conversion is not None
+                    and strategy.capital_gain_harvest is not None
+                ):
+                    # Preserve the forced-income ordinary baseline while
+                    # testing harvest candidates.
+                    action_projections += 1
+                work_per_trial_year += (
+                    action_projections * projection_work
+                )
         return (
             (scenario.end_age - scenario.current_age)
             * scenario.trials
@@ -369,7 +494,10 @@ class PlannerSimulationResult(BaseModel):
     retirement_balance_real: dict[str, float]
     ending_balance_real: dict[str, float]
     lifetime_tax_real: dict[str, float] | None = None
+    lifetime_irmaa_surcharge_real: dict[str, float] | None = None
+    irmaa_exposure_probability: float | None = Field(default=None, ge=0, le=1)
     annual_tax_audit: list[dict[str, object]] = Field(default_factory=list)
+    annual_tax_strategy_actions: list[dict[str, object]] = Field(default_factory=list)
     annual_balance_real: list[dict[str, float | int]]
     funded_spending_ratio: dict[str, float] = Field(
         default_factory=lambda: {"p10": 1.0, "p50": 1.0, "p90": 1.0}
@@ -391,6 +519,7 @@ class PlannerSimulationResult(BaseModel):
         default_factory=list,
     )
     guardrail_metrics: dict[str, object] | None = None
+    household_cash_flow_audit: list[dict[str, object]] = Field(default_factory=list)
     assumptions: dict[str, bool | float | int | str]
     engine: dict[str, str | int]
     reproducibility: dict[str, object]

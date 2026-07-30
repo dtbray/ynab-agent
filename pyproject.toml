@@ -1,14 +1,28 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools>=77.0.3", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ynab-agent"
-version = "0.6.0"
+version = "0.7.0"
 description = "YNAB agent service for transaction reminders and budget queries"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Thomas Bray" }]
 requires-python = ">=3.13"
+keywords = ["budgeting", "cli", "finance", "fastapi", "ynab"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Framework :: FastAPI",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial",
+    "Typing :: Typed",
+]
 dependencies = [
     "ynab>=4.3.0",
     "fastapi>=0.140.13",
@@ -24,6 +38,12 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.51",
     "alembic>=1.18.5",
 ]
+
+[project.urls]
+Homepage = "https://github.com/dtbray/ynab-agent"
+Changelog = "https://github.com/dtbray/ynab-agent/blob/main/CHANGELOG.md"
+Issues = "https://github.com/dtbray/ynab-agent/issues"
+Source = "https://github.com/dtbray/ynab-agent"
 
 [project.scripts]
 ynab = "ynab_agent.cli:app"
@@ -55,7 +75,7 @@ mysql = [
 ]
 
 [tool.setuptools.package-data]
-ynab_agent = ["resources/*.json"]
+ynab_agent = ["py.typed", "resources/*.json"]
 
 [tool.ruff]
 line-length = 100

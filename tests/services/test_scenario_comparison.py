@@ -155,10 +155,12 @@ async def test_common_path_comparison_returns_stable_deltas_and_dominance() -> N
     }
     assert (
         comparison.manifest.engine_identity.simulation_engine_version
-        == "wealth_simulation_v6"
+        == "wealth_simulation_v8"
     )
-    assert comparison.manifest.engine_identity.result_schema_version == 5
-    assert comparison.manifest.engine_identity.manifest_schema_version == 4
+    assert comparison.manifest.schema_version == 4
+    assert comparison.manifest.policy_version == "retirement_outcomes_v3"
+    assert comparison.manifest.engine_identity.result_schema_version == 7
+    assert comparison.manifest.engine_identity.manifest_schema_version == 6
     assert await service.get_comparison(comparison.id) == comparison
 
 
@@ -224,6 +226,83 @@ async def test_progressive_tax_comparison_retains_tax_outcomes_and_attribution()
         change.path.endswith("progressive.indiana_resident")
         and change.kind is ChangeKind.TAX_POLICY
         for change in result.input_changes
+    )
+
+
+@pytest.mark.asyncio
+async def test_tax_strategy_comparison_exposes_irmaa_costs_and_tradeoffs() -> None:
+    repository = MemoryScenarioRepository()
+    service = _service(repository)
+    base_values = {
+        "name": "No conversions",
+        "current_age": 65,
+        "retirement_age": 65,
+        "end_age": 70,
+        "starting_portfolio": 1_000_000,
+        "annual_spending": 40_000,
+        "inflation_rate": 0,
+        "return_mean": 0,
+        "return_volatility": 0,
+        "annual_fee_rate": 0,
+        "trials": 100,
+        "seed": 92,
+        "tax_buckets": [
+            {"tax_treatment": "tax_deferred", "starting_balance": 900_000},
+            {"tax_treatment": "roth", "starting_balance": 100_000},
+        ],
+        "tax_assumptions": {
+            "ordinary_income_tax_rate": 0,
+            "long_term_capital_gains_tax_rate": 0,
+            "tax_model": "progressive_us_indiana",
+            "progressive": {
+                "filing_status": "single",
+                "simulation_start_year": 2026,
+                "taxpayer_birth_year": 1961,
+            },
+            "apply_required_minimum_distributions": False,
+            "withdrawal_order": ["tax_deferred", "roth"],
+            "retirement_surplus_destination": "roth",
+        },
+    }
+    baseline = await service.save_revision(WealthScenario.model_validate(base_values))
+    strategy_values = {
+        **base_values,
+        "name": "Bracket-fill conversion",
+        "tax_assumptions": {
+            **base_values["tax_assumptions"],
+            "strategy": {
+                "withdrawal_policy": "ordered",
+                "roth_conversion": {
+                    "start_age": 65,
+                    "end_age": 65,
+                    "target_federal_ordinary_bracket_rate": 0.24,
+                    "max_annual_conversion_real": 300_000,
+                },
+            },
+        },
+    }
+    strategy = await service.save_revision(
+        WealthScenario.model_validate(strategy_values)
+    )
+
+    comparison = await service.compare(
+        baseline_revision_id=baseline.id,
+        alternative_revision_ids=[strategy.id],
+    )
+
+    alternative = comparison.alternatives[0]
+    assert alternative.delta.lifetime_tax_real_p50 is not None
+    assert alternative.delta.lifetime_irmaa_surcharge_real_p50 is not None
+    assert alternative.delta.lifetime_irmaa_surcharge_real_p50 > 0
+    assert alternative.delta.irmaa_exposure_probability == pytest.approx(1)
+    assert {
+        tradeoff.metric: tradeoff.direction.value
+        for tradeoff in alternative.tradeoffs
+    }["lifetime_irmaa_surcharge_real_p50"] == "cost"
+    assert any(
+        change.path.startswith("tax_assumptions.strategy")
+        and change.kind is ChangeKind.TAX_POLICY
+        for change in alternative.input_changes
     )
 
 

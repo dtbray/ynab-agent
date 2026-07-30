@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from ynab_agent.planning.spending_guardrails import (
     RetirementSpendingPlan,
 )
+from ynab_agent.planning.household_models import Household, age_months_on
 
 
 MAX_SCENARIO_NAME_LENGTH = 200
@@ -19,10 +20,12 @@ MAX_INCOME_STREAMS = 64
 MAX_INCOME_STREAM_NAME_LENGTH = 200
 MAX_CASH_FLOW_STREAMS = 64
 MAX_CASH_FLOW_STREAM_NAME_LENGTH = 200
-MAX_TAX_BUCKETS = 5
+MAX_TAX_BUCKETS = 10
 MAX_SPENDING_TIERS = 8
 MAX_SPENDING_TIER_NAME_LENGTH = 100
 MAX_IRMAA_LOOKBACK_YEARS = 2
+MAX_ASSET_LOCATION_PREFERENCES = 16
+MAX_ASSET_CLASS_NAME_LENGTH = 64
 
 
 class AccountRole(StrEnum):
@@ -92,6 +95,126 @@ class FutureTaxPolicyMode(StrEnum):
 
     INFLATION_INDEXED = "inflation_indexed"
     FIXED_NOMINAL = "fixed_nominal"
+
+
+class WithdrawalPolicy(StrEnum):
+    """How annual portfolio withdrawals are allocated across tax treatments."""
+
+    ORDERED = "ordered"
+    PROPORTIONAL = "proportional"
+
+
+class TaxTreatmentFraction(BaseModel):
+    """One target share of a proportional annual withdrawal."""
+
+    model_config = ConfigDict(allow_inf_nan=False, extra="forbid", frozen=True)
+
+    tax_treatment: TaxTreatment
+    fraction: float = Field(gt=0, le=1)
+
+
+class RothConversionStrategy(BaseModel):
+    """Current-year bracket-fill rule for tax-deferred Roth conversions."""
+
+    model_config = ConfigDict(allow_inf_nan=False, extra="forbid", frozen=True)
+
+    policy_id: str = "roth_bracket_fill_v1"
+    start_age: int = Field(ge=0, le=120)
+    end_age: int = Field(ge=0, le=120)
+    target_federal_ordinary_bracket_rate: float = Field(ge=0.10, le=0.35)
+    max_annual_conversion_real: float = Field(gt=0)
+
+    @model_validator(mode="after")
+    def validate_rule(self) -> RothConversionStrategy:
+        if self.policy_id != "roth_bracket_fill_v1":
+            raise ValueError("unsupported Roth conversion policy")
+        if self.end_age < self.start_age:
+            raise ValueError("Roth conversion end_age must be at least start_age")
+        if self.target_federal_ordinary_bracket_rate not in {
+            0.10,
+            0.12,
+            0.22,
+            0.24,
+            0.32,
+            0.35,
+        }:
+            raise ValueError("Roth conversion target must be a bounded federal bracket rate")
+        return self
+
+
+class CapitalGainHarvestStrategy(BaseModel):
+    """Current-year taxable-gain harvesting rule and realization cap."""
+
+    model_config = ConfigDict(allow_inf_nan=False, extra="forbid", frozen=True)
+
+    policy_id: str = "capital_gain_bracket_fill_v1"
+    start_age: int = Field(ge=0, le=120)
+    end_age: int = Field(ge=0, le=120)
+    target_federal_long_term_capital_gains_rate: float = Field(ge=0, le=0.15)
+    max_annual_gain_real: float = Field(gt=0)
+
+    @model_validator(mode="after")
+    def validate_rule(self) -> CapitalGainHarvestStrategy:
+        if self.policy_id != "capital_gain_bracket_fill_v1":
+            raise ValueError("unsupported capital-gain harvest policy")
+        if self.end_age < self.start_age:
+            raise ValueError("capital-gain harvest end_age must be at least start_age")
+        if self.target_federal_long_term_capital_gains_rate not in {0.0, 0.15}:
+            raise ValueError("capital-gain harvest target must be 0% or 15%")
+        return self
+
+
+class AssetLocationPreference(BaseModel):
+    """Typed advisory hook for a future multi-asset allocation engine."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    asset_class: str = Field(min_length=1, max_length=MAX_ASSET_CLASS_NAME_LENGTH)
+    preferred_tax_treatments: list[TaxTreatment] = Field(
+        min_length=1,
+        max_length=MAX_TAX_BUCKETS,
+    )
+
+    @model_validator(mode="after")
+    def validate_treatments(self) -> AssetLocationPreference:
+        if len(self.preferred_tax_treatments) != len(set(self.preferred_tax_treatments)):
+            raise ValueError("asset-location tax treatments must be unique")
+        return self
+
+
+class TaxStrategyAssumptions(BaseModel):
+    """Versioned, replayable annual tax-strategy decision rules."""
+
+    model_config = ConfigDict(allow_inf_nan=False, extra="forbid", frozen=True)
+
+    policy_id: str = "tax_strategy_v1"
+    withdrawal_policy: WithdrawalPolicy = WithdrawalPolicy.ORDERED
+    proportional_withdrawal_fractions: list[TaxTreatmentFraction] = Field(
+        default_factory=list,
+        max_length=MAX_TAX_BUCKETS,
+    )
+    roth_conversion: RothConversionStrategy | None = None
+    capital_gain_harvest: CapitalGainHarvestStrategy | None = None
+    asset_location_preferences: list[AssetLocationPreference] = Field(
+        default_factory=list,
+        max_length=MAX_ASSET_LOCATION_PREFERENCES,
+    )
+
+    @model_validator(mode="after")
+    def validate_strategy(self) -> TaxStrategyAssumptions:
+        fractions = self.proportional_withdrawal_fractions
+        treatments = [item.tax_treatment for item in fractions]
+        if len(treatments) != len(set(treatments)):
+            raise ValueError("proportional withdrawal tax treatments must be unique")
+        if self.withdrawal_policy is WithdrawalPolicy.PROPORTIONAL:
+            if not fractions or abs(sum(item.fraction for item in fractions) - 1) > 1e-9:
+                raise ValueError("proportional withdrawal fractions must total 1")
+        elif fractions:
+            raise ValueError("ordered withdrawals must not define proportional fractions")
+        asset_classes = [item.asset_class for item in self.asset_location_preferences]
+        if len(asset_classes) != len(set(asset_classes)):
+            raise ValueError("asset-location asset classes must be unique")
+        return self
 
 
 class IrmaaLookbackMagi(BaseModel):
@@ -174,6 +297,7 @@ class ScenarioAccount(BaseModel):
 
     id: str = Field(min_length=1, max_length=MAX_ACCOUNT_ID_LENGTH)
     role: AccountRole
+    owner_person_id: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 class IncomeStream(BaseModel):
@@ -271,6 +395,7 @@ class TaxBucket(BaseModel):
     starting_balance: float = Field(ge=0)
     taxable_basis: float | None = Field(default=None, ge=0)
     contribution_fraction: float = Field(default=0, ge=0, le=1)
+    owner_person_id: str | None = Field(default=None, min_length=1, max_length=64)
 
     @model_validator(mode="after")
     def validate_basis(self) -> TaxBucket:
@@ -291,6 +416,7 @@ class TaxAssumptions(BaseModel):
     long_term_capital_gains_tax_rate: float = Field(ge=0, lt=0.75)
     tax_model: TaxModel = TaxModel.EFFECTIVE_RATES
     progressive: ProgressiveTaxAssumptions | None = None
+    strategy: TaxStrategyAssumptions | None = None
     social_security_taxable_fraction: float = Field(default=0.85, ge=0, le=0.85)
     qualified_hsa_withdrawal_fraction: float = Field(default=1, ge=0, le=1)
     early_distribution_penalty_rate: float = Field(default=0.10, ge=0, lt=0.75)
@@ -359,6 +485,7 @@ class WealthScenario(BaseModel):
         max_length=MAX_SPENDING_TIERS,
     )
     legacy_target_real: float | None = Field(default=None, ge=0)
+    household: Household | None = None
     inflation_rate: float = Field(default=0.025, ge=-0.05, le=0.25)
     return_model: ReturnModel = ReturnModel.LOGNORMAL
     return_mean: float = Field(default=0.06, gt=-0.99, le=1.0)
@@ -407,6 +534,75 @@ class WealthScenario(BaseModel):
             raise ValueError(
                 "retirement spending tier baseline must equal annual_spending"
             )
+        if self.household is not None:
+            primary_age = age_months_on(
+                self.household.people[0].birth_date,
+                self.household.plan_start_date,
+            ) // 12
+            if primary_age != self.current_age:
+                raise ValueError(
+                    "current_age must equal the first household person's age "
+                    "on plan_start_date"
+                )
+            person_ids = {person.id for person in self.household.people}
+            unknown_owners = {
+                bucket.owner_person_id
+                for bucket in self.tax_buckets
+                if bucket.owner_person_id is not None
+                and bucket.owner_person_id not in person_ids
+            }
+            if unknown_owners:
+                raise ValueError("tax bucket owner_person_id must identify a household person")
+            unknown_account_owners = {
+                account.owner_person_id
+                for account in self.accounts
+                if account.owner_person_id is not None
+                and account.owner_person_id not in person_ids
+            }
+            if unknown_account_owners:
+                raise ValueError(
+                    "account owner_person_id must identify a household person"
+                )
+            progressive = (
+                self.tax_assumptions.progressive
+                if self.tax_assumptions is not None
+                else None
+            )
+            if progressive is not None:
+                people = self.household.people
+                if len(people) == 2:
+                    if (
+                        progressive.filing_status
+                        is not FederalFilingStatus.MARRIED_FILING_JOINTLY
+                        or progressive.spouse_birth_year is None
+                    ):
+                        raise ValueError(
+                            "two-person progressive households require "
+                            "married-filing-jointly assumptions"
+                        )
+                    if (
+                        progressive.taxpayer_birth_year != people[0].birth_date.year
+                        or progressive.spouse_birth_year != people[1].birth_date.year
+                    ):
+                        raise ValueError(
+                            "progressive taxpayer birth years must match household people"
+                        )
+                elif progressive.filing_status is FederalFilingStatus.MARRIED_FILING_JOINTLY:
+                    raise ValueError(
+                        "one-person progressive households cannot file jointly"
+                    )
+                elif progressive.taxpayer_birth_year != people[0].birth_date.year:
+                    raise ValueError(
+                        "progressive taxpayer birth year must match household person"
+                    )
+        elif any(
+            account.owner_person_id is not None
+            for account in self.accounts
+        ) or any(
+            bucket.owner_person_id is not None
+            for bucket in self.tax_buckets
+        ):
+            raise ValueError("account ownership requires a household")
         self._validate_tax_model()
         return self
 
@@ -420,9 +616,17 @@ class WealthScenario(BaseModel):
             raise ValueError("tax-aware scenarios require an explicit starting_portfolio")
         if self.withdrawal_tax_rate != 0:
             raise ValueError("tax-aware scenarios must set withdrawal_tax_rate to 0")
-        treatments = [bucket.tax_treatment for bucket in self.tax_buckets]
-        if len(treatments) != len(set(treatments)):
-            raise ValueError("tax_buckets must have unique tax treatments")
+        bucket_keys = [
+            (bucket.tax_treatment, bucket.owner_person_id)
+            for bucket in self.tax_buckets
+        ]
+        if len(bucket_keys) != len(set(bucket_keys)):
+            raise ValueError(
+                "tax_buckets must have unique tax-treatment and owner pairs"
+            )
+        treatments = [
+            bucket.tax_treatment for bucket in self.tax_buckets
+        ]
         bucket_total = sum(bucket.starting_balance for bucket in self.tax_buckets)
         if abs(bucket_total - self.starting_portfolio) > 0.01:
             raise ValueError("tax bucket balances must equal starting_portfolio")
@@ -461,6 +665,63 @@ class WealthScenario(BaseModel):
                 raise ValueError(
                     "taxpayer_birth_year must align with current_age and simulation_start_year"
                 )
+        strategy = self.tax_assumptions.strategy
+        if strategy is not None:
+            if strategy.policy_id != "tax_strategy_v1":
+                raise ValueError("unsupported tax strategy policy")
+            if strategy.withdrawal_policy is WithdrawalPolicy.PROPORTIONAL:
+                fractions = {
+                    item.tax_treatment
+                    for item in strategy.proportional_withdrawal_fractions
+                }
+                if fractions != treatment_set:
+                    raise ValueError(
+                        "proportional withdrawal fractions must cover every tax bucket"
+                    )
+            if (
+                strategy.roth_conversion is not None
+                or strategy.capital_gain_harvest is not None
+            ) and self.tax_assumptions.progressive is None:
+                raise ValueError(
+                    "Roth conversion and gain-harvest strategies require progressive tax"
+                )
+            if strategy.roth_conversion is not None and not {
+                TaxTreatment.TAX_DEFERRED,
+                TaxTreatment.ROTH,
+            }.issubset(treatment_set):
+                raise ValueError(
+                    "Roth conversion strategy requires tax_deferred and roth buckets"
+                )
+            if (
+                strategy.roth_conversion is not None
+                and (
+                    strategy.roth_conversion.start_age < self.retirement_age
+                    or strategy.roth_conversion.end_age >= self.end_age
+                )
+            ):
+                raise ValueError(
+                    "Roth conversion ages must fall within modeled retirement years"
+                )
+            if (
+                strategy.capital_gain_harvest is not None
+                and TaxTreatment.TAXABLE not in treatment_set
+            ):
+                raise ValueError("capital-gain harvest strategy requires a taxable bucket")
+            if (
+                strategy.capital_gain_harvest is not None
+                and (
+                    strategy.capital_gain_harvest.start_age < self.retirement_age
+                    or strategy.capital_gain_harvest.end_age >= self.end_age
+                )
+            ):
+                raise ValueError(
+                    "capital-gain harvest ages must fall within modeled retirement years"
+                )
+            for preference in strategy.asset_location_preferences:
+                if not set(preference.preferred_tax_treatments).issubset(treatment_set):
+                    raise ValueError(
+                        "asset-location preferences require matching tax buckets"
+                    )
         if (
             self.tax_assumptions.ordinary_income_tax_rate
             + self.tax_assumptions.early_distribution_penalty_rate

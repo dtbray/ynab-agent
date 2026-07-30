@@ -36,6 +36,35 @@ SCENARIO: dict[str, object] = {
     "seed": 42,
 }
 
+STRATEGY_SCENARIO: dict[str, object] = {
+    "name": "HTTP tax strategy",
+    "current_age": 65,
+    "retirement_age": 65,
+    "end_age": 66,
+    "starting_portfolio": 200_000,
+    "annual_spending": 40_000,
+    "trials": 100,
+    "seed": 92,
+    "tax_buckets": [
+        {"tax_treatment": "tax_deferred", "starting_balance": 100_000},
+        {"tax_treatment": "roth", "starting_balance": 100_000},
+    ],
+    "tax_assumptions": {
+        "ordinary_income_tax_rate": 0.20,
+        "long_term_capital_gains_tax_rate": 0.15,
+        "apply_required_minimum_distributions": False,
+        "withdrawal_order": ["tax_deferred", "roth"],
+        "retirement_surplus_destination": "roth",
+        "strategy": {
+            "withdrawal_policy": "proportional",
+            "proportional_withdrawal_fractions": [
+                {"tax_treatment": "tax_deferred", "fraction": 0.5},
+                {"tax_treatment": "roth", "fraction": 0.5},
+            ],
+        },
+    },
+}
+
 
 def _runner_output(payload_json: str) -> str:
     payload = PlannerJobPayload.model_validate_json(payload_json)
@@ -182,6 +211,42 @@ def test_submit_is_idempotent_and_returns_typed_result_location(
             assert duplicate.json()["duplicate"] is True
             assert duplicate.json()["job_id"] == accepted["job_id"]
             assert duplicate.headers["location"] == accepted["result_url"]
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_tax_strategy_route_reuses_durable_planner_admission(
+    tmp_path: Path,
+) -> None:
+    application_settings = _database_settings(tmp_path, "http-tax-strategy.db")
+    executor = ThreadPoolExecutor(max_workers=1)
+    application = create_app(
+        application_settings=application_settings,
+        api_settings=_api_settings(),
+        planner_executor=executor,
+        planner_runner=_runner_output,
+    )
+    try:
+        with TestClient(
+            application,
+            client=("127.0.0.1", 50000),
+        ) as client:
+            accepted = client.post(
+                "/wealth/tax/strategies/jobs",
+                json={"scenario": STRATEGY_SCENARIO},
+            )
+            missing_strategy = client.post(
+                "/wealth/tax/strategies/jobs",
+                json={"scenario": SCENARIO},
+            )
+
+        assert accepted.status_code == 202
+        assert accepted.headers["location"] == accepted.json()["result_url"]
+        assert accepted.json()["status_url"].startswith("/planner/jobs/")
+        assert missing_strategy.status_code == 422
+        assert missing_strategy.json()["detail"] == (
+            "scenario must configure tax_assumptions.strategy"
+        )
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 
@@ -507,6 +572,11 @@ def test_submission_body_is_rejected_before_json_parsing_when_oversized(
                 content=iter((b"{", b"x" * 1024, b"}")),
                 headers={"Content-Type": "application/json"},
             )
+            strategy_response = client.post(
+                "/wealth/tax/strategies/jobs",
+                content=b"{" + (b"x" * 1024) + b"}",
+                headers={"Content-Type": "application/json"},
+            )
 
         assert response.status_code == 413
         assert response.json()["detail"] == {
@@ -515,6 +585,8 @@ def test_submission_body_is_rejected_before_json_parsing_when_oversized(
         }
         assert streamed_response.status_code == 413
         assert streamed_response.json() == response.json()
+        assert strategy_response.status_code == 413
+        assert strategy_response.json() == response.json()
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 

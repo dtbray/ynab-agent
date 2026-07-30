@@ -6,17 +6,26 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 from ynab_agent.planning.models import (
+    FederalFilingStatus,
     TaxAssumptions,
     TaxModel,
     TaxTreatment,
     WealthScenario,
+    WithdrawalPolicy,
 )
 from ynab_agent.planning.progressive_tax import (
-    calculate_income_tax_component_arrays,
+    IncomeTaxArrayResult,
     calculate_income_tax_arrays,
     rmd_divisor,
     rmd_start_age,
 )
+from ynab_agent.planning.tax_engine import (
+    HouseholdIncomeTaxInput,
+    HouseholdTaxEngine,
+    calculate_household_progressive_tax_components,
+    household_tax_engine_for,
+)
+from ynab_agent.planning.tax_strategies import decide_tax_strategy
 
 if TYPE_CHECKING:
     import numpy as np
@@ -84,12 +93,22 @@ PROGRESSIVE_TAX_EVALUATIONS_PER_BUCKET = (
 )
 
 
+@dataclass(frozen=True)
+class TaxBucketKey:
+    """Stable owner-aware identity for one tax-character balance."""
+
+    tax_treatment: TaxTreatment
+    owner_person_id: str | None
+
+
 @dataclass
 class TaxAwarePortfolio:
     """Per-trial balances and basis for a bounded set of tax treatments."""
 
-    balances: dict[TaxTreatment, np.ndarray]
-    taxable_basis: np.ndarray | None
+    balances: dict[TaxBucketKey, np.ndarray]
+    taxable_basis: dict[TaxBucketKey, np.ndarray]
+    annual_rmd_nominal: dict[TaxBucketKey, np.ndarray]
+    annual_withdrawal_nominal: dict[TaxBucketKey, np.ndarray]
     cumulative_tax_real: np.ndarray
     annual_tax_nominal: np.ndarray
     annual_effective_rate: np.ndarray
@@ -101,6 +120,12 @@ class TaxAwarePortfolio:
     annual_federal_deduction_nominal: np.ndarray
     annual_realized_long_term_capital_gains_nominal: np.ndarray
     annual_early_distribution_penalty_nominal: np.ndarray
+    annual_modified_adjusted_gross_income_nominal: np.ndarray
+    annual_irmaa_surcharge_nominal: np.ndarray
+    annual_roth_conversion_nominal: np.ndarray
+    annual_harvested_long_term_capital_gains_nominal: np.ndarray
+    cumulative_irmaa_surcharge_real: np.ndarray
+    irmaa_exposed: np.ndarray
 
     @classmethod
     def from_scenario(
@@ -117,33 +142,39 @@ class TaxAwarePortfolio:
         if abs(bucket_total - starting_portfolio) > 0.01:
             raise ValueError("tax bucket balances do not match resolved starting portfolio")
         balances = {
-            bucket.tax_treatment: np.full(
+            TaxBucketKey(
+                bucket.tax_treatment,
+                bucket.owner_person_id,
+            ): np.full(
                 scenario.trials,
                 bucket.starting_balance,
                 dtype=float,
             )
             for bucket in scenario.tax_buckets
         }
-        taxable_bucket = next(
-            (
-                bucket
-                for bucket in scenario.tax_buckets
-                if bucket.tax_treatment is TaxTreatment.TAXABLE
-            ),
-            None,
-        )
-        taxable_basis = None
-        if taxable_bucket is not None:
-            if taxable_bucket.taxable_basis is None:  # pragma: no cover - model invariant
+        taxable_basis: dict[TaxBucketKey, np.ndarray] = {}
+        for bucket in scenario.tax_buckets:
+            if bucket.tax_treatment is not TaxTreatment.TAXABLE:
+                continue
+            if bucket.taxable_basis is None:  # pragma: no cover - model invariant
                 raise RuntimeError("taxable bucket is missing its basis")
-            taxable_basis = np.full(
+            key = TaxBucketKey(bucket.tax_treatment, bucket.owner_person_id)
+            taxable_basis[key] = np.full(
                 scenario.trials,
-                taxable_bucket.taxable_basis,
+                bucket.taxable_basis,
                 dtype=float,
             )
         return cls(
             balances=balances,
             taxable_basis=taxable_basis,
+            annual_rmd_nominal={
+                key: np.zeros(scenario.trials, dtype=float)
+                for key in balances
+            },
+            annual_withdrawal_nominal={
+                key: np.zeros(scenario.trials, dtype=float)
+                for key in balances
+            },
             cumulative_tax_real=np.zeros(scenario.trials, dtype=float),
             annual_tax_nominal=np.zeros(scenario.trials, dtype=float),
             annual_effective_rate=np.zeros(scenario.trials, dtype=float),
@@ -170,7 +201,52 @@ class TaxAwarePortfolio:
                 scenario.trials,
                 dtype=float,
             ),
+            annual_modified_adjusted_gross_income_nominal=np.zeros(
+                scenario.trials,
+                dtype=float,
+            ),
+            annual_irmaa_surcharge_nominal=np.zeros(
+                scenario.trials,
+                dtype=float,
+            ),
+            annual_roth_conversion_nominal=np.zeros(
+                scenario.trials,
+                dtype=float,
+            ),
+            annual_harvested_long_term_capital_gains_nominal=np.zeros(
+                scenario.trials,
+                dtype=float,
+            ),
+            cumulative_irmaa_surcharge_real=np.zeros(
+                scenario.trials,
+                dtype=float,
+            ),
+            irmaa_exposed=np.zeros(scenario.trials, dtype=bool),
         )
+
+    def reset_annual_audit(self) -> None:
+        """Clear tax and strategy audit arrays before evaluating one year."""
+        for values in (
+            self.annual_tax_nominal,
+            self.annual_effective_rate,
+            self.annual_marginal_ordinary_rate,
+            self.annual_marginal_ltcg_rate,
+            self.annual_federal_tax_nominal,
+            self.annual_state_tax_nominal,
+            self.annual_taxable_social_security_nominal,
+            self.annual_federal_deduction_nominal,
+            self.annual_realized_long_term_capital_gains_nominal,
+            self.annual_early_distribution_penalty_nominal,
+            self.annual_modified_adjusted_gross_income_nominal,
+            self.annual_irmaa_surcharge_nominal,
+            self.annual_roth_conversion_nominal,
+            self.annual_harvested_long_term_capital_gains_nominal,
+        ):
+            values.fill(0)
+        for values in self.annual_rmd_nominal.values():
+            values.fill(0)
+        for values in self.annual_withdrawal_nominal.values():
+            values.fill(0)
 
     def total(self, trial_slice: slice) -> np.ndarray:
         import numpy as np
@@ -180,13 +256,31 @@ class TaxAwarePortfolio:
             axis=0,
         )
 
-    def opening_tax_deferred(self, trial_slice: slice) -> np.ndarray:
-        import numpy as np
+    def _keys_for_treatment(
+        self,
+        treatment: TaxTreatment,
+    ) -> tuple[TaxBucketKey, ...]:
+        return tuple(
+            key
+            for key in self.balances
+            if key.tax_treatment is treatment
+        )
 
-        balance = self.balances.get(TaxTreatment.TAX_DEFERRED)
-        if balance is None:
-            return np.zeros_like(self.cumulative_tax_real[trial_slice])
-        return balance[trial_slice].copy()
+    def opening_tax_deferred(
+        self,
+        trial_slice: slice,
+    ) -> dict[TaxBucketKey, np.ndarray]:
+        return {
+            key: self.balances[key][trial_slice].copy()
+            for key in self._keys_for_treatment(TaxTreatment.TAX_DEFERRED)
+        }
+
+    def reset_annual_ownership_audit(self, trial_slice: slice) -> None:
+        """Clear owner-level annual flows for one bounded trial batch."""
+        for values in self.annual_rmd_nominal.values():
+            values[trial_slice] = 0.0
+        for values in self.annual_withdrawal_nominal.values():
+            values[trial_slice] = 0.0
 
     def after_tax_estate_value(
         self,
@@ -194,6 +288,7 @@ class TaxAwarePortfolio:
         *,
         assumptions: TaxAssumptions,
         tax_year: int,
+        joint_filing: np.ndarray | None = None,
     ) -> np.ndarray:
         """Return liquidation value after account-character taxes."""
         import numpy as np
@@ -201,32 +296,47 @@ class TaxAwarePortfolio:
         if assumptions.progressive is not None:
             total = self.total(trial_slice)
             ordinary = np.zeros_like(total)
-            tax_deferred = self.balances.get(TaxTreatment.TAX_DEFERRED)
-            if tax_deferred is not None:
-                ordinary += tax_deferred[trial_slice]
-            hsa = self.balances.get(TaxTreatment.HSA)
-            if hsa is not None:
-                ordinary += hsa[trial_slice] * (1 - assumptions.qualified_hsa_withdrawal_fraction)
-            gains = np.zeros_like(total)
-            taxable = self.balances.get(TaxTreatment.TAXABLE)
-            if taxable is not None:
-                if self.taxable_basis is None:  # pragma: no cover - invariant
-                    raise RuntimeError("taxable balance is missing its basis")
-                gains = np.maximum(
-                    0.0,
-                    taxable[trial_slice] - self.taxable_basis[trial_slice],
+            for key in self._keys_for_treatment(TaxTreatment.TAX_DEFERRED):
+                ordinary += self.balances[key][trial_slice]
+            for key in self._keys_for_treatment(TaxTreatment.HSA):
+                ordinary += self.balances[key][trial_slice] * (
+                    1 - assumptions.qualified_hsa_withdrawal_fraction
                 )
-            liquidation_tax = calculate_income_tax_arrays(
-                assumptions.progressive,
-                tax_year=tax_year,
-                ordinary_income=ordinary,
-                long_term_capital_gains=gains,
-                social_security_income=np.zeros_like(total),
+            aggregate_gains = np.zeros_like(total)
+            for key in self._keys_for_treatment(TaxTreatment.TAXABLE):
+                taxable = self.balances[key]
+                basis = self.taxable_basis.get(key)
+                if basis is None:  # pragma: no cover - invariant
+                    raise RuntimeError("taxable balance is missing its basis")
+                aggregate_gains += (
+                    taxable[trial_slice] - basis[trial_slice]
+                )
+            gains = np.maximum(0.0, aggregate_gains)
+            liquidation_tax = (
+                calculate_income_tax_arrays(
+                    assumptions.progressive,
+                    tax_year=tax_year,
+                    ordinary_income=ordinary,
+                    long_term_capital_gains=gains,
+                    social_security_income=np.zeros_like(total),
+                )
+                if joint_filing is None
+                else calculate_household_progressive_tax_components(
+                    assumptions,
+                    HouseholdIncomeTaxInput(
+                        ordinary_income=ordinary,
+                        social_security_income=np.zeros_like(total),
+                        joint_filing=joint_filing,
+                        tax_year=tax_year,
+                        long_term_capital_gains=gains,
+                    ),
+                ).total_income_tax
             )
             return cast("np.ndarray", total - liquidation_tax)
 
         estate = np.zeros_like(self.cumulative_tax_real[trial_slice])
-        for treatment, all_balances in self.balances.items():
+        for key, all_balances in self.balances.items():
+            treatment = key.tax_treatment
             balance = all_balances[trial_slice]
             if treatment is TaxTreatment.TAX_DEFERRED:
                 estate += balance * (1 - assumptions.ordinary_income_tax_rate)
@@ -236,11 +346,12 @@ class TaxAwarePortfolio:
                 estate += balance * (1 - unqualified * assumptions.ordinary_income_tax_rate)
                 continue
             if treatment is TaxTreatment.TAXABLE:
-                if self.taxable_basis is None:  # pragma: no cover - model invariant
+                basis = self.taxable_basis.get(key)
+                if basis is None:  # pragma: no cover - model invariant
                     raise RuntimeError("taxable balance is missing its basis")
                 gains = np.maximum(
                     0.0,
-                    balance - self.taxable_basis[trial_slice],
+                    balance - basis[trial_slice],
                 )
                 estate += balance - gains * assumptions.long_term_capital_gains_tax_rate
                 continue
@@ -257,12 +368,19 @@ class TaxAwarePortfolio:
     ) -> None:
         for balance in self.balances.values():
             balance[trial_slice] *= gross_return
-        taxable = self.balances.get(TaxTreatment.TAXABLE)
-        if taxable is None or assumptions.taxable_account_annual_tax_drag_rate == 0:
+        taxable_keys = self._keys_for_treatment(TaxTreatment.TAXABLE)
+        if not taxable_keys or assumptions.taxable_account_annual_tax_drag_rate == 0:
             return
-        tax_drag = taxable[trial_slice] * assumptions.taxable_account_annual_tax_drag_rate
-        taxable[trial_slice] -= tax_drag
-        self.cumulative_tax_real[trial_slice] += tax_drag / inflation_factor
+        for key in taxable_keys:
+            taxable = self.balances[key]
+            tax_drag = (
+                taxable[trial_slice]
+                * assumptions.taxable_account_annual_tax_drag_rate
+            )
+            taxable[trial_slice] -= tax_drag
+            self.cumulative_tax_real[trial_slice] += (
+                tax_drag / inflation_factor
+            )
 
     def add_contribution(
         self,
@@ -273,14 +391,17 @@ class TaxAwarePortfolio:
         destination: TaxTreatment | None,
     ) -> None:
         if destination is not None:
-            self._deposit(trial_slice, destination, amount)
+            self._deposit_treatment(trial_slice, destination, amount)
             return
         for bucket in scenario.tax_buckets:
             if bucket.contribution_fraction == 0:
                 continue
-            self._deposit(
+            self._deposit_key(
                 trial_slice,
-                bucket.tax_treatment,
+                TaxBucketKey(
+                    bucket.tax_treatment,
+                    bucket.owner_person_id,
+                ),
                 amount * bucket.contribution_fraction,
             )
 
@@ -294,9 +415,12 @@ class TaxAwarePortfolio:
         ordinary_income: float | np.ndarray,
         social_security_income: float | np.ndarray,
         tax_free_income: float | np.ndarray,
-        opening_tax_deferred: np.ndarray,
+        opening_tax_deferred: dict[TaxBucketKey, np.ndarray],
         inflation_factor: float | np.ndarray,
         assumptions: TaxAssumptions,
+        joint_filing: np.ndarray | None = None,
+        tax_engine: HouseholdTaxEngine | None = None,
+        owner_birth_years: dict[str, int] | None = None,
     ) -> np.ndarray:
         """Fund one retirement year and return unmet spending by trial."""
         import numpy as np
@@ -304,12 +428,15 @@ class TaxAwarePortfolio:
         ordinary = np.asarray(ordinary_income, dtype=float)
         social_security = np.asarray(social_security_income, dtype=float)
         tax_free = np.asarray(tax_free_income, dtype=float)
+        owner_birth_year_map = owner_birth_years or {}
+        self.reset_annual_ownership_audit(trial_slice)
         required_minimum = self._required_minimum_distribution(
             trial_slice,
             age=age,
             tax_year=tax_year,
             opening_balance=opening_tax_deferred,
             assumptions=assumptions,
+            owner_birth_years=owner_birth_year_map,
         )
         ordinary = ordinary + required_minimum
         if assumptions.tax_model is TaxModel.PROGRESSIVE_US_INDIANA:
@@ -323,38 +450,99 @@ class TaxAwarePortfolio:
                 tax_free_income=tax_free,
                 inflation_factor=inflation_factor,
                 assumptions=assumptions,
+                joint_filing=joint_filing,
+                tax_engine=tax_engine,
+                owner_birth_years=owner_birth_year_map,
             )
-        income_tax = assumptions.ordinary_income_tax_rate * (
-            ordinary + social_security * assumptions.social_security_taxable_fraction
+        selected_tax_engine = household_tax_engine_for(assumptions, tax_engine)
+        shape = self.cumulative_tax_real[trial_slice].shape
+        ordinary = np.broadcast_to(ordinary, shape).astype(float, copy=True)
+        social_security = np.broadcast_to(
+            social_security, shape
+        ).astype(float, copy=True)
+        income_tax = selected_tax_engine.income_tax(
+            HouseholdIncomeTaxInput(
+                ordinary_income=ordinary,
+                social_security_income=social_security,
+                joint_filing=(
+                    np.zeros_like(ordinary, dtype=bool)
+                    if joint_filing is None
+                    else joint_filing
+                ),
+                tax_year=tax_year,
+                long_term_capital_gains=np.zeros_like(ordinary),
+            ),
+            assumptions=assumptions,
         )
         self.cumulative_tax_real[trial_slice] += income_tax / inflation_factor
         available_cash = ordinary + social_security + tax_free - income_tax
         remaining = np.maximum(0.0, spending - available_cash)
         surplus = np.maximum(0.0, available_cash - spending)
         if np.any(surplus):
-            self._deposit(
+            self._deposit_treatment(
                 trial_slice,
                 assumptions.retirement_surplus_destination,
                 surplus,
             )
 
-        for treatment in assumptions.withdrawal_order:
+        requests: list[tuple[TaxTreatment, np.ndarray | None]]
+        strategy = assumptions.strategy
+        if (
+            strategy is not None
+            and strategy.withdrawal_policy is WithdrawalPolicy.PROPORTIONAL
+        ):
+            initial_need = remaining.copy()
+            requests = [
+                (item.tax_treatment, initial_need * item.fraction)
+                for item in strategy.proportional_withdrawal_fractions
+            ]
+            requests.extend(
+                (treatment, None)
+                for treatment in assumptions.withdrawal_order
+            )
+        else:
+            requests = [
+                (treatment, None)
+                for treatment in assumptions.withdrawal_order
+            ]
+        for treatment, target in requests:
             if not np.any(remaining > 0.005):
                 break
-            tax_rate = self._withdrawal_tax_rate(
-                treatment,
-                age=age,
-                assumptions=assumptions,
+            requested = (
+                remaining.copy()
+                if target is None
+                else np.minimum(remaining, target)
             )
-            gross, tax = self._withdraw_for_net_need(
-                trial_slice,
-                treatment=treatment,
-                remaining=remaining,
-                tax_rate=tax_rate,
-                capital_gains_rate=assumptions.long_term_capital_gains_tax_rate,
-            )
-            remaining = np.maximum(0.0, remaining - (gross - tax))
-            self.cumulative_tax_real[trial_slice] += tax / inflation_factor
+            if not np.any(requested > 0.005):
+                continue
+            for key in self._keys_for_treatment(treatment):
+                if not np.any(requested > 0.005):
+                    break
+                owner_age = (
+                    tax_year - owner_birth_year_map[key.owner_person_id]
+                    if key.owner_person_id is not None
+                    and key.owner_person_id in owner_birth_year_map
+                    else age
+                )
+                tax_rate = self._withdrawal_tax_rate(
+                    treatment,
+                    age=owner_age,
+                    assumptions=assumptions,
+                )
+                gross, tax = self._withdraw_for_net_need(
+                    trial_slice,
+                    key=key,
+                    remaining=requested,
+                    tax_rate=tax_rate,
+                    capital_gains_rate=(
+                        assumptions.long_term_capital_gains_tax_rate
+                    ),
+                )
+                remaining = np.maximum(0.0, remaining - (gross - tax))
+                requested = np.maximum(0.0, requested - (gross - tax))
+                self.cumulative_tax_real[trial_slice] += (
+                    tax / inflation_factor
+                )
         return cast("np.ndarray", remaining)
 
     def _fund_progressive_spending(
@@ -369,8 +557,284 @@ class TaxAwarePortfolio:
         tax_free_income: np.ndarray,
         inflation_factor: float | np.ndarray,
         assumptions: TaxAssumptions,
+        joint_filing: np.ndarray | None,
+        tax_engine: HouseholdTaxEngine | None,
+        owner_birth_years: dict[str, int],
     ) -> np.ndarray:
-        """Fund spending against the incremental liability of each withdrawal."""
+        """Jointly choose bounded tax actions and fund the current year."""
+        import numpy as np
+
+        progressive = assumptions.progressive
+        if progressive is None:  # pragma: no cover - model invariant
+            raise RuntimeError("progressive tax assumptions are missing")
+        shape = self.cumulative_tax_real[trial_slice].shape
+        zeros = np.zeros(shape, dtype=float)
+        ordinary = np.broadcast_to(
+            ordinary_income,
+            shape,
+        ).astype(float, copy=True)
+        strategy = assumptions.strategy
+        if strategy is None:
+            return self._execute_progressive_spending(
+                trial_slice,
+                age=age,
+                tax_year=tax_year,
+                spending=spending,
+                ordinary_income=ordinary,
+                social_security_income=social_security_income,
+                tax_free_income=tax_free_income,
+                inflation_factor=inflation_factor,
+                assumptions=assumptions,
+                joint_filing=joint_filing,
+                tax_engine=tax_engine,
+                owner_birth_years=owner_birth_years,
+                initial_gains=zeros,
+                noncash_ordinary_income=zeros,
+            )
+
+        balance_snapshots = {
+            key: values[trial_slice].copy()
+            for key, values in self.balances.items()
+        }
+        basis_snapshots = {
+            key: values[trial_slice].copy()
+            for key, values in self.taxable_basis.items()
+        }
+        cumulative_tax_snapshot = (
+            self.cumulative_tax_real[trial_slice].copy()
+        )
+        audit_names = (
+            "annual_tax_nominal",
+            "annual_effective_rate",
+            "annual_marginal_ordinary_rate",
+            "annual_marginal_ltcg_rate",
+            "annual_federal_tax_nominal",
+            "annual_state_tax_nominal",
+            "annual_taxable_social_security_nominal",
+            "annual_federal_deduction_nominal",
+            "annual_realized_long_term_capital_gains_nominal",
+            "annual_early_distribution_penalty_nominal",
+            "annual_modified_adjusted_gross_income_nominal",
+        )
+        audit_snapshots = {
+            name: getattr(self, name)[trial_slice].copy()
+            for name in audit_names
+        }
+        withdrawal_snapshots = {
+            key: values[trial_slice].copy()
+            for key, values in self.annual_withdrawal_nominal.items()
+        }
+
+        def restore_state() -> None:
+            for key, values in balance_snapshots.items():
+                self.balances[key][trial_slice] = values
+            for key, values in basis_snapshots.items():
+                self.taxable_basis[key][trial_slice] = values
+            self.cumulative_tax_real[trial_slice] = (
+                cumulative_tax_snapshot
+            )
+            for name, values in audit_snapshots.items():
+                getattr(self, name)[trial_slice] = values
+            for key, values in withdrawal_snapshots.items():
+                self.annual_withdrawal_nominal[key][trial_slice] = values
+
+        def aggregate(treatment: TaxTreatment) -> np.ndarray:
+            keys = self._keys_for_treatment(treatment)
+            if not keys:
+                return np.zeros(shape, dtype=float)
+            return np.sum(
+                [self.balances[key][trial_slice] for key in keys],
+                axis=0,
+            )
+
+        def aggregate_taxable_basis() -> np.ndarray:
+            keys = self._keys_for_treatment(TaxTreatment.TAXABLE)
+            if not keys:
+                return np.zeros(shape, dtype=float)
+            return np.sum(
+                [self.taxable_basis[key][trial_slice] for key in keys],
+                axis=0,
+            )
+
+        roth_keys = self._keys_for_treatment(TaxTreatment.ROTH)
+
+        def conversion_destination(
+            source: TaxBucketKey,
+        ) -> TaxBucketKey | None:
+            return next(
+                (
+                    key
+                    for key in roth_keys
+                    if key.owner_person_id == source.owner_person_id
+                ),
+                None,
+            )
+
+        def convertible_tax_deferred_balance() -> np.ndarray:
+            keys = [
+                key
+                for key in self._keys_for_treatment(
+                    TaxTreatment.TAX_DEFERRED
+                )
+                if conversion_destination(key) is not None
+            ]
+            if not keys:
+                return np.zeros(shape, dtype=float)
+            return np.sum(
+                [self.balances[key][trial_slice] for key in keys],
+                axis=0,
+            )
+
+        def apply_actions(
+            conversion: np.ndarray,
+            harvest: np.ndarray,
+        ) -> None:
+            conversion_remaining = conversion.copy()
+            deferred_keys = self._keys_for_treatment(
+                TaxTreatment.TAX_DEFERRED
+            )
+            for source in deferred_keys:
+                destination = conversion_destination(source)
+                if destination is None:
+                    continue
+                source_balance = self.balances[source][trial_slice]
+                moved = np.minimum(source_balance, conversion_remaining)
+                source_balance -= moved
+                self.balances[destination][trial_slice] += moved
+                conversion_remaining -= moved
+
+            harvest_remaining = harvest.copy()
+            for key in self._keys_for_treatment(TaxTreatment.TAXABLE):
+                balance = self.balances[key][trial_slice]
+                basis = self.taxable_basis[key][trial_slice]
+                harvested = np.minimum(
+                    np.maximum(0.0, balance - basis),
+                    harvest_remaining,
+                )
+                basis += harvested
+                harvest_remaining -= harvested
+
+        def project_final_taxable_position(
+            conversion: np.ndarray,
+            harvest: np.ndarray,
+        ) -> tuple[np.ndarray, np.ndarray]:
+            restore_state()
+            apply_actions(conversion, harvest)
+            self._execute_progressive_spending(
+                trial_slice,
+                age=age,
+                tax_year=tax_year,
+                spending=spending,
+                ordinary_income=ordinary + conversion,
+                social_security_income=social_security_income,
+                tax_free_income=tax_free_income,
+                inflation_factor=inflation_factor,
+                assumptions=assumptions,
+                joint_filing=joint_filing,
+                tax_engine=tax_engine,
+                owner_birth_years=owner_birth_years,
+                initial_gains=harvest,
+                noncash_ordinary_income=conversion,
+            )
+            adjusted_gross_income = (
+                self.annual_modified_adjusted_gross_income_nominal[
+                    trial_slice
+                ]
+            )
+            deduction = self.annual_federal_deduction_nominal[
+                trial_slice
+            ]
+            realized_gains = (
+                self.annual_realized_long_term_capital_gains_nominal[
+                    trial_slice
+                ]
+            )
+            taxable_income = np.maximum(
+                0.0,
+                adjusted_gross_income - deduction,
+            )
+            taxable_ordinary = np.maximum(
+                0.0,
+                taxable_income - realized_gains,
+            )
+            restore_state()
+            return taxable_ordinary.copy(), taxable_income.copy()
+
+        conversion_cap: float | np.ndarray = 0.0
+        if strategy.roth_conversion is not None:
+            conversion_cap = (
+                strategy.roth_conversion.max_annual_conversion_real
+                * inflation_factor
+            )
+        harvest_cap: float | np.ndarray = 0.0
+        if strategy.capital_gain_harvest is not None:
+            harvest_cap = (
+                strategy.capital_gain_harvest.max_annual_gain_real
+                * inflation_factor
+            )
+        decision = decide_tax_strategy(
+            strategy,
+            progressive,
+            age=age,
+            tax_year=tax_year,
+            tax_deferred_balance=convertible_tax_deferred_balance(),
+            taxable_balance=aggregate(TaxTreatment.TAXABLE),
+            taxable_basis=aggregate_taxable_basis(),
+            nominal_conversion_cap=conversion_cap,
+            nominal_harvest_cap=harvest_cap,
+            project_final_taxable_position=(
+                project_final_taxable_position
+            ),
+        )
+        restore_state()
+        apply_actions(
+            decision.roth_conversion,
+            decision.harvested_long_term_capital_gains,
+        )
+        self.annual_roth_conversion_nominal[trial_slice] = (
+            decision.roth_conversion
+        )
+        self.annual_harvested_long_term_capital_gains_nominal[
+            trial_slice
+        ] = decision.harvested_long_term_capital_gains
+        return self._execute_progressive_spending(
+            trial_slice,
+            age=age,
+            tax_year=tax_year,
+            spending=spending,
+            ordinary_income=ordinary + decision.roth_conversion,
+            social_security_income=social_security_income,
+            tax_free_income=tax_free_income,
+            inflation_factor=inflation_factor,
+            assumptions=assumptions,
+            joint_filing=joint_filing,
+            tax_engine=tax_engine,
+            owner_birth_years=owner_birth_years,
+            initial_gains=(
+                decision.harvested_long_term_capital_gains
+            ),
+            noncash_ordinary_income=decision.roth_conversion,
+        )
+
+    def _execute_progressive_spending(
+        self,
+        trial_slice: slice,
+        *,
+        age: int,
+        tax_year: int,
+        spending: float | np.ndarray,
+        ordinary_income: np.ndarray,
+        social_security_income: np.ndarray,
+        tax_free_income: np.ndarray,
+        inflation_factor: float | np.ndarray,
+        assumptions: TaxAssumptions,
+        joint_filing: np.ndarray | None,
+        tax_engine: HouseholdTaxEngine | None,
+        owner_birth_years: dict[str, int],
+        initial_gains: np.ndarray,
+        noncash_ordinary_income: np.ndarray,
+    ) -> np.ndarray:
+        """Execute one progressive-tax year against the current owner state."""
         import numpy as np
 
         progressive = assumptions.progressive
@@ -383,151 +847,233 @@ class TaxAwarePortfolio:
             shape,
         ).astype(float, copy=True)
         tax_free = np.broadcast_to(tax_free_income, shape).astype(float, copy=False)
-        zero_gains = np.zeros(shape, dtype=float)
-        starting_components = calculate_income_tax_component_arrays(
-            progressive,
-            tax_year=tax_year,
-            ordinary_income=ordinary,
-            long_term_capital_gains=zero_gains,
-            social_security_income=social_security,
+        gains = initial_gains.copy()
+        filing = (
+            np.full(
+                shape,
+                progressive.filing_status
+                is FederalFilingStatus.MARRIED_FILING_JOINTLY,
+                dtype=bool,
+            )
+            if joint_filing is None
+            else np.broadcast_to(joint_filing, shape)
         )
+        selected_tax_engine = household_tax_engine_for(assumptions, tax_engine)
+
+        def tax_input(
+            ordinary_value: np.ndarray,
+            gains_value: np.ndarray,
+        ) -> HouseholdIncomeTaxInput:
+            return HouseholdIncomeTaxInput(
+                ordinary_income=ordinary_value,
+                social_security_income=social_security,
+                joint_filing=filing,
+                tax_year=tax_year,
+                long_term_capital_gains=gains_value,
+            )
+
+        def tax_components(
+            ordinary_value: np.ndarray,
+            gains_value: np.ndarray,
+        ) -> IncomeTaxArrayResult:
+            return calculate_household_progressive_tax_components(
+                assumptions,
+                tax_input(ordinary_value, gains_value),
+            )
+
+        def total_tax(
+            ordinary_value: np.ndarray,
+            gains_value: np.ndarray,
+        ) -> np.ndarray:
+            return selected_tax_engine.income_tax(
+                tax_input(ordinary_value, gains_value),
+                assumptions=assumptions,
+            )
+
+        starting_components = tax_components(ordinary, gains)
         income_tax = starting_components.total_income_tax
         self.cumulative_tax_real[trial_slice] += income_tax / inflation_factor
-        available_cash = ordinary + social_security + tax_free - income_tax
+        available_cash = (
+            ordinary
+            - noncash_ordinary_income
+            + social_security
+            + tax_free
+            - income_tax
+        )
         remaining = np.maximum(0.0, spending - available_cash)
         surplus = np.maximum(0.0, available_cash - spending)
         if np.any(surplus):
-            self._deposit(
+            self._deposit_treatment(
                 trial_slice,
                 assumptions.retirement_surplus_destination,
                 surplus,
             )
 
-        gains = zero_gains
         current_tax = income_tax
         annual_penalty = np.zeros(shape, dtype=float)
-        for treatment in assumptions.withdrawal_order:
+        requests: list[tuple[TaxTreatment, np.ndarray | None]]
+        strategy = assumptions.strategy
+        if (
+            strategy is not None
+            and strategy.withdrawal_policy is WithdrawalPolicy.PROPORTIONAL
+        ):
+            initial_need = remaining.copy()
+            requests = [
+                (item.tax_treatment, initial_need * item.fraction)
+                for item in strategy.proportional_withdrawal_fractions
+            ]
+            requests.extend(
+                (treatment, None)
+                for treatment in assumptions.withdrawal_order
+            )
+        else:
+            requests = [
+                (treatment, None)
+                for treatment in assumptions.withdrawal_order
+            ]
+        for treatment, target in requests:
             if not np.any(remaining > 0.005):
                 break
-            balance = self.balances.get(treatment)
-            if balance is None:
+            requested = (
+                remaining.copy()
+                if target is None
+                else np.minimum(remaining, target)
+            )
+            if not np.any(requested > 0.005):
                 continue
-            available = balance[trial_slice]
-            ordinary_fraction: float | np.ndarray = 0.0
-            gain_fraction: float | np.ndarray = 0.0
-            penalty_rate = 0.0
-            basis_ratio: np.ndarray | None = None
-            if treatment is TaxTreatment.TAX_DEFERRED:
-                ordinary_fraction = 1.0
-                if age < 60:
-                    penalty_rate = assumptions.early_distribution_penalty_rate
-            elif treatment is TaxTreatment.HSA:
-                ordinary_fraction = 1 - assumptions.qualified_hsa_withdrawal_fraction
-                if age < 65:
-                    penalty_rate = (
-                        assumptions.hsa_early_distribution_penalty_rate * ordinary_fraction
+            for key in self._keys_for_treatment(treatment):
+                if not np.any(requested > 0.005):
+                    break
+                balance = self.balances[key]
+                available = balance[trial_slice]
+                owner_age = (
+                    tax_year - owner_birth_years[key.owner_person_id]
+                    if key.owner_person_id is not None
+                    and key.owner_person_id in owner_birth_years
+                    else age
+                )
+                ordinary_fraction: float | np.ndarray = 0.0
+                gain_fraction: float | np.ndarray = 0.0
+                penalty_rate = 0.0
+                basis_ratio: np.ndarray | None = None
+                if treatment is TaxTreatment.TAX_DEFERRED:
+                    ordinary_fraction = 1.0
+                    if owner_age < 60:
+                        penalty_rate = assumptions.early_distribution_penalty_rate
+                elif treatment is TaxTreatment.HSA:
+                    ordinary_fraction = (
+                        1 - assumptions.qualified_hsa_withdrawal_fraction
                     )
-            elif treatment is TaxTreatment.TAXABLE:
-                if self.taxable_basis is None:  # pragma: no cover - invariant
-                    raise RuntimeError("taxable balance is missing its basis")
-                basis_ratio = np.divide(
-                    self.taxable_basis[trial_slice],
-                    available,
-                    out=np.zeros_like(available),
-                    where=available > 0,
-                )
-                gain_fraction = np.maximum(0.0, 1 - basis_ratio)
+                    if owner_age < 65:
+                        penalty_rate = (
+                            assumptions.hsa_early_distribution_penalty_rate
+                            * ordinary_fraction
+                        )
+                elif treatment is TaxTreatment.TAXABLE:
+                    taxable_basis = self.taxable_basis.get(key)
+                    if taxable_basis is None:  # pragma: no cover - invariant
+                        raise RuntimeError("taxable balance is missing its basis")
+                    basis_ratio = np.divide(
+                        taxable_basis[trial_slice],
+                        available,
+                        out=np.zeros_like(available),
+                        where=available > 0,
+                    )
+                    gain_fraction = np.maximum(0.0, 1 - basis_ratio)
 
-            low = np.zeros_like(remaining)
-            high = np.minimum(
-                available,
-                np.maximum(remaining, 0.01),
-            )
-            after_tax = current_tax
-            net = np.zeros_like(remaining)
-            for _ in range(PROGRESSIVE_WITHDRAWAL_MAX_BRACKET_STEPS):
-                after_tax = calculate_income_tax_arrays(
-                    progressive,
-                    tax_year=tax_year,
-                    ordinary_income=ordinary + high * ordinary_fraction,
-                    long_term_capital_gains=gains + high * gain_fraction,
-                    social_security_income=social_security,
+                low = np.zeros_like(remaining)
+                high = np.minimum(
+                    available,
+                    np.maximum(requested, 0.01),
                 )
-                net = high - (after_tax - current_tax) - high * penalty_rate
-                needs_larger_bracket = (net < remaining) & (high < available)
-                if not np.any(needs_larger_bracket):
-                    break
-                low = np.where(needs_larger_bracket, high, low)
-                high = np.where(
-                    needs_larger_bracket,
-                    np.minimum(available, np.maximum(0.01, high * 2)),
-                    high,
+                after_tax = current_tax
+                net = np.zeros_like(remaining)
+                for _ in range(PROGRESSIVE_WITHDRAWAL_MAX_BRACKET_STEPS):
+                    after_tax = total_tax(
+                        ordinary + high * ordinary_fraction,
+                        gains + high * gain_fraction,
+                    )
+                    net = (
+                        high
+                        - (after_tax - current_tax)
+                        - high * penalty_rate
+                    )
+                    needs_larger_bracket = (
+                        (net < requested) & (high < available)
+                    )
+                    if not np.any(needs_larger_bracket):
+                        break
+                    low = np.where(needs_larger_bracket, high, low)
+                    high = np.where(
+                        needs_larger_bracket,
+                        np.minimum(
+                            available,
+                            np.maximum(0.01, high * 2),
+                        ),
+                        high,
+                    )
+                unresolved = (net < requested) & (high < available)
+                if np.any(unresolved):
+                    high = np.where(unresolved, available, high)
+                    after_tax = total_tax(
+                        ordinary + high * ordinary_fraction,
+                        gains + high * gain_fraction,
+                    )
+                    net = (
+                        high
+                        - (after_tax - current_tax)
+                        - high * penalty_rate
+                    )
+                fundable = net >= requested
+                low = np.where(fundable, low, available)
+                high = np.where(fundable, high, available)
+                for _ in range(PROGRESSIVE_WITHDRAWAL_MAX_BISECTION_STEPS):
+                    active = fundable & ((high - low) > 0.005)
+                    if not np.any(active):
+                        break
+                    gross = (low + high) / 2
+                    after_tax = total_tax(
+                        ordinary + gross * ordinary_fraction,
+                        gains + gross * gain_fraction,
+                    )
+                    net = (
+                        gross
+                        - (after_tax - current_tax)
+                        - gross * penalty_rate
+                    )
+                    insufficient = active & (net < requested)
+                    sufficient = active & ~insufficient
+                    low = np.where(insufficient, gross, low)
+                    high = np.where(sufficient, gross, high)
+                gross = np.where(fundable, high, available)
+                final_components = tax_components(
+                    ordinary + gross * ordinary_fraction,
+                    gains + gross * gain_fraction,
                 )
-            unresolved = (net < remaining) & (high < available)
-            if np.any(unresolved):
-                high = np.where(unresolved, available, high)
-                after_tax = calculate_income_tax_arrays(
-                    progressive,
-                    tax_year=tax_year,
-                    ordinary_income=ordinary + high * ordinary_fraction,
-                    long_term_capital_gains=gains + high * gain_fraction,
-                    social_security_income=social_security,
+                after_tax = final_components.total_income_tax
+                incremental_tax = after_tax - current_tax
+                penalty = gross * penalty_rate
+                net = gross - incremental_tax - penalty
+                balance[trial_slice] -= gross
+                self.annual_withdrawal_nominal[key][trial_slice] += gross
+                if basis_ratio is not None:
+                    taxable_basis = self.taxable_basis.get(key)
+                    if taxable_basis is None:  # pragma: no cover - invariant
+                        raise RuntimeError("taxable balance is missing its basis")
+                    taxable_basis[trial_slice] -= np.minimum(
+                        taxable_basis[trial_slice],
+                        gross * basis_ratio,
+                    )
+                ordinary = ordinary + gross * ordinary_fraction
+                gains = gains + gross * gain_fraction
+                current_tax = after_tax
+                remaining = np.maximum(0.0, remaining - net)
+                requested = np.maximum(0.0, requested - net)
+                self.cumulative_tax_real[trial_slice] += (
+                    (incremental_tax + penalty) / inflation_factor
                 )
-                net = high - (after_tax - current_tax) - high * penalty_rate
-            fundable = net >= remaining
-            low = np.where(fundable, low, available)
-            high = np.where(fundable, high, available)
-            for _ in range(PROGRESSIVE_WITHDRAWAL_MAX_BISECTION_STEPS):
-                active = fundable & ((high - low) > 0.005)
-                if not np.any(active):
-                    break
-                gross = (low + high) / 2
-                after_tax = calculate_income_tax_arrays(
-                    progressive,
-                    tax_year=tax_year,
-                    ordinary_income=ordinary + gross * ordinary_fraction,
-                    long_term_capital_gains=gains + gross * gain_fraction,
-                    social_security_income=social_security,
-                )
-                net = gross - (after_tax - current_tax) - gross * penalty_rate
-                insufficient = active & (net < remaining)
-                sufficient = active & ~insufficient
-                low = np.where(insufficient, gross, low)
-                high = np.where(sufficient, gross, high)
-            gross = np.where(fundable, high, available)
-            final_components = calculate_income_tax_component_arrays(
-                progressive,
-                tax_year=tax_year,
-                ordinary_income=ordinary + gross * ordinary_fraction,
-                long_term_capital_gains=gains + gross * gain_fraction,
-                social_security_income=social_security,
-            )
-            after_tax = final_components.total_income_tax
-            incremental_tax = after_tax - current_tax
-            penalty = gross * penalty_rate
-            net = gross - incremental_tax - penalty
-            balance[trial_slice] -= gross
-            if basis_ratio is not None:
-                taxable_basis = self.taxable_basis
-                if taxable_basis is None:  # pragma: no cover - invariant
-                    raise RuntimeError("taxable balance is missing its basis")
-                taxable_basis[trial_slice] -= np.minimum(
-                    taxable_basis[trial_slice],
-                    gross * basis_ratio,
-                )
-            ordinary = ordinary + gross * ordinary_fraction
-            gains = gains + gross * gain_fraction
-            current_tax = after_tax
-            remaining = np.maximum(0.0, remaining - net)
-            self.cumulative_tax_real[trial_slice] += (incremental_tax + penalty) / inflation_factor
-            annual_penalty += penalty
-        final_components = calculate_income_tax_component_arrays(
-            progressive,
-            tax_year=tax_year,
-            ordinary_income=ordinary,
-            long_term_capital_gains=gains,
-            social_security_income=social_security,
-        )
+                annual_penalty += penalty
+        final_components = tax_components(ordinary, gains)
         current_tax = final_components.total_income_tax
         total_income = ordinary + gains + social_security
         self.annual_tax_nominal[trial_slice] = current_tax + annual_penalty
@@ -537,20 +1083,8 @@ class TaxAwarePortfolio:
             out=np.zeros_like(current_tax),
             where=total_income > 0,
         )
-        ordinary_plus_one = calculate_income_tax_arrays(
-            progressive,
-            tax_year=tax_year,
-            ordinary_income=ordinary + 1,
-            long_term_capital_gains=gains,
-            social_security_income=social_security,
-        )
-        gains_plus_one = calculate_income_tax_arrays(
-            progressive,
-            tax_year=tax_year,
-            ordinary_income=ordinary,
-            long_term_capital_gains=gains + 1,
-            social_security_income=social_security,
-        )
+        ordinary_plus_one = total_tax(ordinary + 1, gains)
+        gains_plus_one = total_tax(ordinary, gains + 1)
         self.annual_marginal_ordinary_rate[trial_slice] = ordinary_plus_one - current_tax
         self.annual_marginal_ltcg_rate[trial_slice] = gains_plus_one - current_tax
         self.annual_federal_tax_nominal[trial_slice] = final_components.federal_income_tax
@@ -560,21 +1094,54 @@ class TaxAwarePortfolio:
         )
         self.annual_federal_deduction_nominal[trial_slice] = final_components.federal_deduction
         self.annual_realized_long_term_capital_gains_nominal[trial_slice] = gains
+        self.annual_modified_adjusted_gross_income_nominal[trial_slice] = (
+            final_components.federal_adjusted_gross_income
+        )
         self.annual_early_distribution_penalty_nominal[trial_slice] = annual_penalty
         return cast("np.ndarray", remaining)
 
-    def _deposit(
+    def _deposit_key(
+        self,
+        trial_slice: slice,
+        key: TaxBucketKey,
+        amount: float | np.ndarray,
+    ) -> None:
+        balance = self.balances[key]
+        balance[trial_slice] += amount
+        if key.tax_treatment is TaxTreatment.TAXABLE:
+            taxable_basis = self.taxable_basis.get(key)
+            if taxable_basis is None:  # pragma: no cover - model invariant
+                raise RuntimeError("taxable balance is missing its basis")
+            taxable_basis[trial_slice] += amount
+
+    def _deposit_treatment(
         self,
         trial_slice: slice,
         treatment: TaxTreatment,
         amount: float | np.ndarray,
     ) -> None:
-        balance = self.balances[treatment]
-        balance[trial_slice] += amount
-        if treatment is TaxTreatment.TAXABLE:
-            if self.taxable_basis is None:  # pragma: no cover - model invariant
-                raise RuntimeError("taxable balance is missing its basis")
-            self.taxable_basis[trial_slice] += amount
+        import numpy as np
+
+        keys = self._keys_for_treatment(treatment)
+        if not keys:
+            raise ValueError(
+                f"deposit destination has no {treatment.value} tax bucket"
+            )
+        if len(keys) == 1:
+            self._deposit_key(trial_slice, keys[0], amount)
+            return
+        balances = np.stack(
+            [self.balances[key][trial_slice] for key in keys]
+        )
+        totals = np.sum(balances, axis=0)
+        for index, key in enumerate(keys):
+            fraction = np.divide(
+                balances[index],
+                totals,
+                out=np.full_like(totals, 1 / len(keys)),
+                where=totals > 0,
+            )
+            self._deposit_key(trial_slice, key, amount * fraction)
 
     def _required_minimum_distribution(
         self,
@@ -582,36 +1149,46 @@ class TaxAwarePortfolio:
         *,
         age: int,
         tax_year: int,
-        opening_balance: np.ndarray,
+        opening_balance: dict[TaxBucketKey, np.ndarray],
         assumptions: TaxAssumptions,
+        owner_birth_years: dict[str, int],
     ) -> np.ndarray:
         import numpy as np
 
-        tax_deferred = self.balances.get(TaxTreatment.TAX_DEFERRED)
+        aggregate = np.zeros_like(self.cumulative_tax_real[trial_slice])
+        if not assumptions.apply_required_minimum_distributions:
+            return aggregate
         progressive = assumptions.progressive
-        rmd_age = tax_year - progressive.taxpayer_birth_year if progressive is not None else age
-        progressive_start_age = (
-            rmd_start_age(progressive.taxpayer_birth_year)
-            if progressive is not None
-            else assumptions.rmd_start_age
-        )
-        if (
-            tax_deferred is None
-            or not assumptions.apply_required_minimum_distributions
-            or rmd_age < progressive_start_age
-        ):
-            return np.zeros_like(opening_balance)
-        divisor = (
-            rmd_divisor(rmd_age)
-            if progressive is not None
-            else _RMD_DIVISORS.get(min(rmd_age, 120), 2.0)
-        )
-        required = np.minimum(
-            tax_deferred[trial_slice],
-            opening_balance / divisor,
-        )
-        tax_deferred[trial_slice] -= required
-        return cast("np.ndarray", required)
+        for key in self._keys_for_treatment(TaxTreatment.TAX_DEFERRED):
+            birth_year = (
+                owner_birth_years.get(key.owner_person_id)
+                if key.owner_person_id is not None
+                else None
+            )
+            if birth_year is None and progressive is not None:
+                birth_year = progressive.taxpayer_birth_year
+            owner_age = tax_year - birth_year if birth_year is not None else age
+            start_age = (
+                rmd_start_age(birth_year)
+                if progressive is not None and birth_year is not None
+                else assumptions.rmd_start_age
+            )
+            if owner_age < start_age:
+                continue
+            divisor = (
+                rmd_divisor(owner_age)
+                if progressive is not None
+                else _RMD_DIVISORS.get(min(owner_age, 120), 2.0)
+            )
+            balance = self.balances[key]
+            required = np.minimum(
+                balance[trial_slice],
+                opening_balance[key] / divisor,
+            )
+            balance[trial_slice] -= required
+            self.annual_rmd_nominal[key][trial_slice] += required
+            aggregate += required
+        return aggregate
 
     def _withdrawal_tax_rate(
         self,
@@ -633,26 +1210,24 @@ class TaxAwarePortfolio:
         self,
         trial_slice: slice,
         *,
-        treatment: TaxTreatment,
+        key: TaxBucketKey,
         remaining: np.ndarray,
         tax_rate: float,
         capital_gains_rate: float,
     ) -> tuple[np.ndarray, np.ndarray]:
         import numpy as np
 
-        balance = self.balances.get(treatment)
-        if balance is None:
-            zeros = np.zeros_like(remaining)
-            return zeros, zeros
+        treatment = key.tax_treatment
+        balance = self.balances[key]
         available = balance[trial_slice]
         effective_rate: float | np.ndarray = tax_rate
         basis_ratio: np.ndarray | None = None
         if treatment is TaxTreatment.TAXABLE:
-            if self.taxable_basis is None:  # pragma: no cover - model invariant
+            basis = self.taxable_basis.get(key)
+            if basis is None:  # pragma: no cover - model invariant
                 raise RuntimeError("taxable balance is missing its basis")
-            basis = self.taxable_basis[trial_slice]
             basis_ratio = np.divide(
-                basis,
+                basis[trial_slice],
                 available,
                 out=np.zeros_like(available),
                 where=available > 0,
@@ -668,8 +1243,9 @@ class TaxAwarePortfolio:
         gross = np.minimum(available, gross_needed)
         tax = gross * effective_rate
         balance[trial_slice] -= gross
+        self.annual_withdrawal_nominal[key][trial_slice] += gross
         if treatment is TaxTreatment.TAXABLE and basis_ratio is not None:
-            taxable_basis = self.taxable_basis
+            taxable_basis = self.taxable_basis.get(key)
             if taxable_basis is None:  # pragma: no cover - model invariant
                 raise RuntimeError("taxable balance is missing its basis")
             basis_reduction = np.minimum(
@@ -684,14 +1260,26 @@ def estimate_tax_state_bytes(scenario: WealthScenario) -> int:
     """Conservative resident-memory estimate for tax-aware trial state."""
     if not scenario.tax_buckets:
         return 0
-    # Portfolio totals/rates plus the component arrays retained for annual audits.
-    array_count = len(scenario.tax_buckets) + 11
-    if any(bucket.tax_treatment is TaxTreatment.TAXABLE for bucket in scenario.tax_buckets):
-        array_count += 1
+    bucket_count = len(scenario.tax_buckets)
+    taxable_count = sum(
+        bucket.tax_treatment is TaxTreatment.TAXABLE
+        for bucket in scenario.tax_buckets
+    )
+    # Every bucket retains a balance plus annual owner-level RMD and withdrawal
+    # audit arrays. Taxable buckets retain their own basis; fixed tax, IRMAA,
+    # and strategy audit state contributes another seventeen arrays.
+    array_count = 3 * bucket_count + taxable_count + 17
     if (
         scenario.tax_assumptions is not None
         and scenario.tax_assumptions.tax_model is TaxModel.PROGRESSIVE_US_INDIANA
     ):
-        # Bisection and bracket calculations reuse these bounded batch arrays.
+        # Bisections plus starting/projected owner balances, withdrawal ledgers,
+        # and starting/projected taxable bases.
+        array_count += 14 + 3 * bucket_count + 2 * taxable_count
+    if (
+        scenario.tax_assumptions is not None
+        and scenario.tax_assumptions.strategy is not None
+    ):
+        # Joint conversion/harvest low, high, and candidate projection state.
         array_count += 14
     return scenario.trials * array_count * 8

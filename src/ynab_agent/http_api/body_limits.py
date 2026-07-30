@@ -14,6 +14,8 @@ _BOUNDED_POST_PATHS = {
     "/planner/jobs",
     "/wealth/scenarios/revisions",
     "/wealth/scenarios/comparisons",
+    "/wealth/tax/strategies/jobs",
+    "/wealth/social-security/optimize",
 }
 
 
@@ -87,11 +89,12 @@ async def _send_too_large(
     receive: Receive,
     send: Send,
 ) -> None:
-    message = (
-        "planner job request body exceeds the configured limit"
-        if scope["path"] == "/planner/jobs"
-        else "scenario request body exceeds the configured limit"
-    )
+    if scope["path"] in {"/planner/jobs", "/wealth/tax/strategies/jobs"}:
+        message = "planner job request body exceeds the configured limit"
+    elif scope["path"] == "/wealth/social-security/optimize":
+        message = "Social Security optimization request body exceeds the configured limit"
+    else:
+        message = "scenario request body exceeds the configured limit"
     response = JSONResponse(
         status_code=413,
         content={

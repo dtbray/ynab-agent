@@ -49,12 +49,14 @@ COMMAND_TREE = {
     },
     ("wealth",): {
         "accounts",
+        "optimize-social-security",
         "simulate",
         "solve",
         "performance",
         "spending",
         "scenarios",
         "tax",
+        "tax-strategy",
     },
     ("wealth", "spending"): {"map", "list", "baseline", "preview"},
     ("wealth", "scenarios"): {"save", "compare"},
@@ -91,6 +93,8 @@ LEAF_COMMANDS = (
     ("reports", "hygiene"),
     ("wealth", "accounts"),
     ("wealth", "tax"),
+    ("wealth", "tax-strategy"),
+    ("wealth", "optimize-social-security"),
     ("wealth", "simulate"),
     ("wealth", "solve"),
     ("wealth", "performance"),
@@ -134,6 +138,10 @@ CRITICAL_OPTIONS = {
         "--html",
         "--json",
     },
+    ("wealth", "optimize-social-security"): {
+        "--scenario",
+        "--json",
+    },
     ("wealth", "solve"): {
         "--scenario",
         "--for",
@@ -161,6 +169,7 @@ CRITICAL_OPTIONS = {
         "--json",
     },
     ("wealth", "tax"): {"--input", "--json"},
+    ("wealth", "tax-strategy"): {"--scenario", "--returns", "--json"},
 }
 
 _COMMAND_ROW = re.compile(r"^│ ([a-z][a-z0-9-]*)\s{2,}", re.MULTILINE)

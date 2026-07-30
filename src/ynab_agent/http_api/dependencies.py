@@ -31,6 +31,9 @@ from ynab_agent.services.scenario_comparison import (
     BoundedScenarioComparisonExecutor,
     ScenarioComparisonService,
 )
+from ynab_agent.services.social_security import (
+    SocialSecurityOptimizationExecutor,
+)
 from ynab_agent.services.wealth import WealthService
 
 from .settings import HttpApiSettings
@@ -47,6 +50,7 @@ class HttpApiRuntime:
     historical_datasets: HistoricalDatasetRegistry
     planner_execution_policy: PlannerExecutionPolicy
     scenario_comparison_executor: BoundedScenarioComparisonExecutor
+    social_security_optimizer: SocialSecurityOptimizationExecutor
     database_factory: DatabaseFactory = DatabaseManager
 
 
@@ -128,6 +132,19 @@ async def get_scenario_comparison_service(
 ScenarioComparisonServiceDep = Annotated[
     ScenarioComparisonService,
     Depends(get_scenario_comparison_service, scope="function"),
+]
+
+
+def get_social_security_optimizer(
+    runtime: HttpRuntimeDep,
+) -> SocialSecurityOptimizationExecutor:
+    """Return the lifespan-owned bounded optimizer execution port."""
+    return runtime.social_security_optimizer
+
+
+SocialSecurityOptimizerDep = Annotated[
+    SocialSecurityOptimizationExecutor,
+    Depends(get_social_security_optimizer),
 ]
 
 

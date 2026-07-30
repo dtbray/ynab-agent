@@ -81,7 +81,8 @@ python -m ruff check src tests migrations
 python -m mypy \
   src/ynab_agent/planning \
   src/ynab_agent/services/wealth.py
-python -m build --wheel
+python -m build
+python -m twine check dist/*
 ```
 
 ## Security and scope
