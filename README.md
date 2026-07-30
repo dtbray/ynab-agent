@@ -95,7 +95,7 @@ advice.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+GNU Affero General Public License v3.0 or later. See [LICENSE](LICENSE).
 
 YNAB is a trademark of YNAB. This independent project is not affiliated with
 or endorsed by YNAB.

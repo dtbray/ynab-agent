@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+- License the project under the GNU Affero General Public License v3.0 or
+  later.
+
 ## 0.6.0 - 2026-07-30
 
 ### Added
