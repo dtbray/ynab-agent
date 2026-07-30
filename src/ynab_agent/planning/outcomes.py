@@ -127,6 +127,8 @@ class OutcomeAccumulator:
         required_real: float | np.ndarray,
         shortfall_real: np.ndarray,
         failed: np.ndarray,
+        active: bool | np.ndarray = True,
+        spending_scale: float | np.ndarray = 1.0,
     ) -> None:
         """Record one year's real spending outcomes for one trial batch."""
         import numpy as np
@@ -135,17 +137,28 @@ class OutcomeAccumulator:
             np.asarray(required_real, dtype=float),
             shortfall_real.shape,
         )
+        active_values = np.broadcast_to(
+            np.asarray(active, dtype=bool),
+            shortfall_real.shape,
+        )
+        scale = np.broadcast_to(
+            np.asarray(spending_scale, dtype=float),
+            shortfall_real.shape,
+        )
+        required = np.where(active_values, required, 0.0)
+        shortfall_real = np.where(active_values, shortfall_real, 0.0)
         funded = np.maximum(0.0, required - shortfall_real)
         self.cumulative_required_real[trial_slice] += required
         self.cumulative_shortfall_real[trial_slice] += shortfall_real
 
         prior_failures = self.failure_years[trial_slice] > 0
-        recovered = prior_failures & ~failed
+        active_failure = active_values & failed
+        recovered = prior_failures & active_values & ~failed
         self.recovered_after_failure[trial_slice] |= recovered
-        self.failure_years[trial_slice] += failed
+        self.failure_years[trial_slice] += active_failure
         current = self.current_failure_streak[trial_slice]
-        current[failed] += 1
-        current[~failed] = 0
+        current[active_failure] += 1
+        current[active_values & ~failed] = 0
         np.maximum(
             self.longest_failure_streak[trial_slice],
             current,
@@ -153,8 +166,12 @@ class OutcomeAccumulator:
         )
 
         for tier_index, tier in enumerate(self.scenario.spending_tiers):
+            tier_funded = (
+                funded + _REAL_SHORTFALL_TOLERANCE
+                >= tier.annual_amount * scale
+            )
             self.tier_attained[tier_index, trial_slice] &= (
-                funded + _REAL_SHORTFALL_TOLERANCE >= tier.annual_amount
+                ~active_values | tier_funded
             )
 
     def summarize(

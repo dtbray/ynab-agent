@@ -14,6 +14,9 @@ from ynab_agent.planning.models import (
     WealthScenario,
 )
 from ynab_agent.planning.mortgage import MortgageProjection
+from ynab_agent.planning.social_security_optimizer import (
+    SocialSecurityOptimizationResult,
+)
 from ynab_agent.services.wealth import AccountFreshness, ResolvedStartingPortfolio
 
 
@@ -133,6 +136,18 @@ class ScenarioValidationRequest(WealthScenario):
     """A wealth scenario accepted for structural and cached-account validation."""
 
     model_config = ConfigDict(extra="forbid")
+
+
+class SocialSecurityOptimizationRequest(WealthScenario):
+    """A bounded household strategy comparison request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class SocialSecurityOptimizationResponse(BaseModel):
+    """Typed result of a bounded Social Security claiming comparison."""
+
+    result: SocialSecurityOptimizationResult
 
 
 class ValuationProvenanceRead(BaseModel):

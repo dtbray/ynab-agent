@@ -21,13 +21,14 @@ from ynab_agent.cli_support import (
     render_rows,
 )
 from ynab_agent.config import settings
-from ynab_agent.planning.models import WealthScenario
+from ynab_agent.planning.models import TaxTreatment, WealthScenario
 from ynab_agent.planning.progressive_tax import (
     TaxCalculationInput,
     calculate_annual_tax,
 )
 from ynab_agent.planning.reporting import write_simulation_html
 from ynab_agent.planning.simulation import SimulationResult, simulate
+from ynab_agent.planning.social_security_optimizer import optimize_social_security
 from ynab_agent.planning.solver import SolveVariable, solve_scenario
 from ynab_agent.runtime import open_wealth_service
 from ynab_agent.services.wealth import ResolvedStartingPortfolio
@@ -49,6 +50,32 @@ def _load_tax_request(request_path: Path) -> TaxCalculationInput:
             f"invalid tax request file: {exc}",
             param_hint="--input",
         ) from exc
+
+
+def _action_p50(action: dict[str, object], field: str) -> float:
+    value = action.get(field)
+    if not isinstance(value, dict):
+        raise ValueError(f"tax-strategy action is missing {field}")
+    percentile = value.get("p50")
+    if not isinstance(percentile, (float, int)):
+        raise ValueError(f"tax-strategy action has invalid {field}")
+    return float(percentile)
+
+
+def _withdrawal_p50(
+    action: dict[str, object],
+    treatment: TaxTreatment,
+) -> float:
+    withdrawals = action.get("withdrawals_nominal")
+    if not isinstance(withdrawals, dict):
+        raise ValueError("tax-strategy action is missing withdrawals_nominal")
+    value = withdrawals.get(treatment.value)
+    if not isinstance(value, dict):
+        return 0.0
+    percentile = value.get("p50")
+    if not isinstance(percentile, (float, int)):
+        raise ValueError(f"tax-strategy action has invalid {treatment.value} withdrawal")
+    return float(percentile)
 
 
 async def _starting_portfolio(
@@ -324,6 +351,204 @@ def simulate_command(
         _render_goal_outcomes(result)
         if written_html is not None:
             console.print(f"Interactive report: {written_html}")
+
+    asyncio.run(run())
+
+
+@wealth_app.command("tax-strategy")
+def tax_strategy_command(
+    scenario_path: Annotated[
+        Path,
+        typer.Option(
+            "--scenario",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Private scenario containing versioned tax strategy assumptions",
+        ),
+    ],
+    returns_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--returns",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Historical returns CSV required by historical_bootstrap scenarios",
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit the complete replayable simulation result"),
+    ] = False,
+) -> None:
+    """Evaluate and print a deterministic annual tax-strategy schedule."""
+    scenario = load_scenario(scenario_path)
+    if scenario.tax_assumptions is None or scenario.tax_assumptions.strategy is None:
+        raise typer.BadParameter(
+            "scenario must configure tax_assumptions.strategy",
+            param_hint="--scenario",
+        )
+    history = load_history(scenario, returns_path)
+
+    async def run() -> None:
+        try:
+            starting_portfolio = await _starting_portfolio(scenario)
+            result = simulate(
+                scenario,
+                starting_portfolio.value,
+                historical_series=history,
+                valuation_provenance=starting_portfolio.provenance,
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise typer.BadParameter(str(exc), param_hint="--scenario") from exc
+        if json_output:
+            print_json(result.as_dict())
+            return
+        render_rows(
+            [
+                {
+                    "year": action["tax_year"],
+                    "age": action["age"],
+                    "conversion": format_dollars(
+                        _action_p50(action, "roth_conversion_nominal")
+                    ),
+                    "gain_harvest": format_dollars(
+                        _action_p50(
+                            action,
+                            "harvested_long_term_capital_gains_nominal",
+                        )
+                    ),
+                }
+                for action in result.annual_tax_strategy_actions
+            ],
+            [
+                ("year", "Tax Year"),
+                ("age", "Age"),
+                ("conversion", "Roth Conversion P50"),
+                ("gain_harvest", "Gain Harvest P50"),
+            ],
+        )
+        render_rows(
+            [
+                {
+                    "year": action["tax_year"],
+                    "age": action["age"],
+                    "tax_treatment": treatment.value,
+                    "withdrawal": format_dollars(
+                        _withdrawal_p50(action, treatment)
+                    ),
+                }
+                for action in result.annual_tax_strategy_actions
+                for treatment in TaxTreatment
+            ],
+            [
+                ("year", "Tax Year"),
+                ("age", "Age"),
+                ("tax_treatment", "Tax Treatment"),
+                ("withdrawal", "Withdrawal P50"),
+            ],
+        )
+        render_rows(
+            [
+                {
+                    "lifetime_tax": (
+                        format_dollars(result.lifetime_tax_real["p50"])
+                        if result.lifetime_tax_real is not None
+                        else ""
+                    ),
+                    "irmaa": (
+                        format_dollars(result.lifetime_irmaa_surcharge_real["p50"])
+                        if result.lifetime_irmaa_surcharge_real is not None
+                        else ""
+                    ),
+                    "irmaa_exposure": (
+                        f"{result.irmaa_exposure_probability:.1%}"
+                        if result.irmaa_exposure_probability is not None
+                        else ""
+                    ),
+                    "funded_spending": f"{result.funded_spending_ratio['p50']:.1%}",
+                    "shortfall": format_dollars(
+                        result.cumulative_shortfall_real["p50"]
+                    ),
+                    "after_tax_estate": (
+                        format_dollars(result.after_tax_ending_balance_real["p50"])
+                        if result.after_tax_ending_balance_real is not None
+                        else ""
+                    ),
+                }
+            ],
+            [
+                ("lifetime_tax", "Lifetime Tax P50"),
+                ("irmaa", "IRMAA P50"),
+                ("irmaa_exposure", "IRMAA Exposure"),
+                ("funded_spending", "Funded Spending P50"),
+                ("shortfall", "Shortfall P50"),
+                ("after_tax_estate", "After-Tax Estate P50"),
+            ],
+        )
+
+    asyncio.run(run())
+
+
+@wealth_app.command("optimize-social-security")
+def optimize_social_security_command(
+    scenario_path: Annotated[
+        Path,
+        typer.Option(
+            "--scenario",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Path to a private household wealth scenario JSON file",
+        ),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit the complete ranked comparison"),
+    ] = False,
+) -> None:
+    """Compare ages 62–70 on household portfolio outcomes."""
+    scenario = load_scenario(scenario_path)
+
+    async def run() -> None:
+        try:
+            starting_portfolio = await _starting_portfolio(scenario)
+            result = optimize_social_security(
+                scenario,
+                starting_portfolio.value,
+                valuation_provenance=starting_portfolio.provenance,
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise typer.BadParameter(str(exc), param_hint="--scenario") from exc
+        if json_output:
+            print_json(result.model_dump(mode="json"))
+            return
+        render_rows(
+            [
+                {
+                    "person": person_id,
+                    "claim_age": claim_age,
+                    "success": f"{result.recommended.success_rate:.1%}",
+                    "funded_spending_p50": (
+                        f"{result.recommended.funded_spending_ratio_p50:.1%}"
+                    ),
+                    "ending_portfolio_p50": format_dollars(
+                        result.recommended.tax_adjusted_ending_portfolio_p50
+                    ),
+                }
+                for person_id, claim_age in (
+                    result.recommended.claim_age_by_person.items()
+                )
+            ],
+            [
+                ("person", "Person"),
+                ("claim_age", "Claim Age"),
+                ("success", "Success"),
+                ("funded_spending_p50", "Funded Spending p50"),
+                ("ending_portfolio_p50", "After-tax Ending p50"),
+            ],
+        )
 
     asyncio.run(run())
 

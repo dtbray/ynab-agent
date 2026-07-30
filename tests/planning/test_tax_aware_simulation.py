@@ -454,3 +454,115 @@ def test_starting_portfolio_solver_scales_tax_buckets_and_basis() -> None:
     assert result.value == pytest.approx(55_600, abs=100)
     assert result.simulation.starting_portfolio == result.value
     assert result.simulation.success_rate == 1
+
+
+def test_owner_specific_rmds_use_each_bucket_owners_age() -> None:
+    scenario = _scenario(
+        current_age=75,
+        retirement_age=75,
+        end_age=76,
+        starting_portfolio=44_600,
+        annual_spending=100,
+        household={
+            "plan_start_date": "2026-01-02",
+            "people": [
+                {
+                    "id": "older",
+                    "name": "Older",
+                    "birth_date": "1951-01-02",
+                    "retirement_age_months": 75 * 12,
+                },
+                {
+                    "id": "younger",
+                    "name": "Younger",
+                    "birth_date": "1956-01-02",
+                    "retirement_age_months": 70 * 12,
+                },
+            ],
+        },
+        tax_buckets=[
+            {
+                "tax_treatment": "tax_deferred",
+                "owner_person_id": "older",
+                "starting_balance": 24_600,
+            },
+            {
+                "tax_treatment": "tax_deferred",
+                "owner_person_id": "younger",
+                "starting_balance": 20_000,
+            },
+        ],
+        tax_assumptions={
+            "ordinary_income_tax_rate": 0.20,
+            "long_term_capital_gains_tax_rate": 0.15,
+            "rmd_start_age": 75,
+            "withdrawal_order": ["tax_deferred"],
+            "retirement_surplus_destination": "tax_deferred",
+        },
+    )
+
+    result = simulate(scenario, 44_600)
+
+    flows = {
+        row["owner_person_id"]: row
+        for row in result.annual_tax_audit[0]["owner_flows"]  # type: ignore[index]
+    }
+    assert flows["older"]["required_minimum_distribution_nominal"]["p50"] == (  # type: ignore[index]
+        pytest.approx(1_000)
+    )
+    assert flows["younger"]["required_minimum_distribution_nominal"]["p50"] == (  # type: ignore[index]
+        0
+    )
+
+
+def test_duplicate_tax_treatments_withdraw_and_audit_by_owner() -> None:
+    scenario = _scenario(
+        starting_portfolio=200,
+        annual_spending=150,
+        household={
+            "plan_start_date": "2026-01-02",
+            "people": [
+                {
+                    "id": "first",
+                    "name": "First",
+                    "birth_date": "1961-01-02",
+                    "retirement_age_months": 65 * 12,
+                },
+                {
+                    "id": "second",
+                    "name": "Second",
+                    "birth_date": "1961-01-02",
+                    "retirement_age_months": 65 * 12,
+                },
+            ],
+        },
+        tax_buckets=[
+            {
+                "tax_treatment": "cash",
+                "owner_person_id": "first",
+                "starting_balance": 100,
+            },
+            {
+                "tax_treatment": "cash",
+                "owner_person_id": "second",
+                "starting_balance": 100,
+            },
+        ],
+        tax_assumptions={
+            "ordinary_income_tax_rate": 0,
+            "long_term_capital_gains_tax_rate": 0,
+            "apply_required_minimum_distributions": False,
+            "withdrawal_order": ["cash"],
+            "retirement_surplus_destination": "cash",
+        },
+    )
+
+    result = simulate(scenario, 200)
+
+    assert result.ending_balance_real["p50"] == pytest.approx(50)
+    flows = {
+        row["owner_person_id"]: row
+        for row in result.annual_tax_audit[0]["owner_flows"]  # type: ignore[index]
+    }
+    assert flows["first"]["withdrawal_nominal"]["p50"] == pytest.approx(100)  # type: ignore[index]
+    assert flows["second"]["withdrawal_nominal"]["p50"] == pytest.approx(50)  # type: ignore[index]

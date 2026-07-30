@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Response, status
 
 from ynab_agent.planning.models import WealthScenario
 from ynab_agent.planning.progressive_tax import (
@@ -13,14 +13,33 @@ from ynab_agent.planning.progressive_tax import (
     TaxCalculationInput,
     calculate_annual_tax,
 )
+from ynab_agent.planning.paths import ResourceLimitError
+from ynab_agent.services.planner_jobs import (
+    PlannerErrorCode,
+    PlannerJobServiceError,
+    PlannerJobSubmission,
+    PlannerQueueSaturatedError,
+    PlannerResourceLimitError,
+)
 
-from ..dependencies import WealthServiceDep, require_api_access
+from ..dependencies import (
+    PlannerJobServiceDep,
+    SocialSecurityOptimizerDep,
+    WealthServiceDep,
+    require_api_access,
+)
+from ..schemas.planner_jobs import (
+    PlannerJobAcceptedResponse,
+    PlannerJobSubmitRequest,
+)
 from ..schemas.wealth import (
     AccountFreshnessRead,
     AccountFreshnessResponse,
     MortgageProjectionRead,
     ScenarioValidationRequest,
     ScenarioValidationResponse,
+    SocialSecurityOptimizationRequest,
+    SocialSecurityOptimizationResponse,
 )
 
 
@@ -41,6 +60,56 @@ def calculate_tax(request: TaxCalculationInput) -> AnnualTaxResult:
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
         ) from exc
+
+
+@router.post(
+    "/tax/strategies/jobs",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def submit_tax_strategy_job(
+    request: PlannerJobSubmitRequest,
+    response: Response,
+    service: PlannerJobServiceDep,
+) -> PlannerJobAcceptedResponse:
+    """Submit a replayable tax-strategy simulation to shared planner admission."""
+    scenario = WealthScenario.model_validate(request.scenario.model_dump())
+    if scenario.tax_assumptions is None or scenario.tax_assumptions.strategy is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="scenario must configure tax_assumptions.strategy",
+        )
+    try:
+        submitted = await service.submit(
+            PlannerJobSubmission(
+                scenario=scenario,
+                historical_dataset_id=request.historical_dataset_id,
+            )
+        )
+    except PlannerJobServiceError as exc:
+        status_code = {
+            PlannerErrorCode.QUEUE_SATURATED: status.HTTP_429_TOO_MANY_REQUESTS,
+            PlannerErrorCode.DISPATCH_FAILED: status.HTTP_503_SERVICE_UNAVAILABLE,
+        }.get(exc.code, status.HTTP_422_UNPROCESSABLE_CONTENT)
+        raise HTTPException(
+            status_code=status_code,
+            detail={"code": exc.code.value, "message": exc.message},
+            headers=(
+                {"Retry-After": "5"}
+                if exc.code is PlannerErrorCode.QUEUE_SATURATED
+                else None
+            ),
+        ) from exc
+    job = submitted.job
+    result_url = f"/planner/jobs/{job.id}/result"
+    response.headers["Location"] = result_url
+    return PlannerJobAcceptedResponse(
+        job_id=job.id,
+        request_hash=job.request_hash,
+        state=job.state,
+        duplicate=submitted.duplicate,
+        status_url=f"/planner/jobs/{job.id}",
+        result_url=result_url,
+    )
 
 
 @router.get("/accounts/freshness")
@@ -110,3 +179,38 @@ async def validate_scenario(
             detail=str(exc),
         ) from exc
     return ScenarioValidationResponse.from_service(scenario, resolved)
+
+
+@router.post("/social-security/optimize")
+async def optimize_household_social_security(
+    request: SocialSecurityOptimizationRequest,
+    service: WealthServiceDep,
+    optimizer: SocialSecurityOptimizerDep,
+) -> SocialSecurityOptimizationResponse:
+    """Run a bounded strategy matrix without blocking the API event loop."""
+    scenario = WealthScenario.model_validate(request.model_dump())
+    try:
+        resolved = await service.resolve_starting_portfolio_with_provenance(
+            scenario
+        )
+        result = await optimizer.execute(
+            scenario,
+            resolved.value,
+            resolved.provenance,
+        )
+    except PlannerQueueSaturatedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=exc.message,
+        ) from exc
+    except (PlannerResourceLimitError, ResourceLimitError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Social Security optimization exceeds configured planner resources",
+        ) from exc
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
+    return SocialSecurityOptimizationResponse(result=result)

@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  release:
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'mirror/release-v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out merged main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Validate release branch and version
+        id: version
+        env:
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          version="$(python -c \
+            'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          case "$HEAD_BRANCH" in
+            "mirror/release-v${version}-"*) ;;
+            *)
+              echo "Release branch does not match pyproject version" >&2
+              exit 1
+              ;;
+          esac
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and validate distributions
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+          python -m build
+          python -m twine check dist/*
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "$RELEASE_TAG already exists; nothing to publish"
+            exit 0
+          fi
+          gh release create "$RELEASE_TAG" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TAG" \
+            --generate-notes

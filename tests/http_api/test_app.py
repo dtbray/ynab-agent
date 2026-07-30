@@ -10,6 +10,10 @@ from pydantic import SecretStr
 import pytest
 
 from ynab_agent.config import Settings
+from ynab_agent.planning.models import ValuationProvenance, WealthScenario
+from ynab_agent.planning.social_security_optimizer import (
+    SocialSecurityOptimizationResult,
+)
 from ynab_agent.runtime import DatabaseFactory
 from ynab_agent.http_api.app import create_app
 from ynab_agent.http_api.settings import HttpApiSettings
@@ -121,6 +125,8 @@ def test_openapi_exposes_only_the_intended_service_surface() -> None:
         "/wealth/scenarios/comparisons",
         "/wealth/scenarios/comparisons/{comparison_id}",
         "/wealth/tax/calculate",
+        "/wealth/tax/strategies/jobs",
+        "/wealth/social-security/optimize",
         "/planner/jobs",
         "/planner/jobs/{job_id}",
         "/planner/jobs/{job_id}/result",
@@ -147,6 +153,7 @@ def test_openapi_exposes_only_the_intended_service_surface() -> None:
         schema["paths"]["/wealth/scenarios/comparisons/{comparison_id}"]
     ) == {"get"}
     assert set(schema["paths"]["/wealth/tax/calculate"]) == {"post"}
+    assert set(schema["paths"]["/wealth/tax/strategies/jobs"]) == {"post"}
     assert schema["paths"]["/wealth/accounts/freshness"]["get"]["tags"] == [
         "wealth"
     ]
@@ -157,6 +164,9 @@ def test_openapi_exposes_only_the_intended_service_surface() -> None:
         "wealth-scenarios"
     ]
     assert schema["paths"]["/wealth/tax/calculate"]["post"]["tags"] == ["wealth"]
+    assert schema["paths"]["/wealth/tax/strategies/jobs"]["post"]["tags"] == [
+        "wealth"
+    ]
     assert schema["paths"][
         "/wealth/accounts/{account_id}/mortgage-projection"
     ]["get"]["tags"] == ["wealth"]
@@ -196,6 +206,9 @@ def test_openapi_exposes_only_the_intended_service_surface() -> None:
         {"HTTPBearer": []}
     ]
     assert schema["paths"]["/wealth/tax/calculate"]["post"]["security"] == [
+        {"HTTPBearer": []}
+    ]
+    assert schema["paths"]["/wealth/tax/strategies/jobs"]["post"]["security"] == [
         {"HTTPBearer": []}
     ]
     assert schema["paths"][
@@ -420,6 +433,111 @@ def test_scenario_validation_translates_cached_account_errors() -> None:
     }
     assert len(created) == 2
     assert all(database.close_calls == 1 for database in created)
+
+
+class _FailingSocialSecurityOptimizer:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, float, ValuationProvenance]] = []
+
+    async def execute(
+        self,
+        scenario: WealthScenario,
+        starting_portfolio: float,
+        valuation_provenance: ValuationProvenance,
+    ) -> SocialSecurityOptimizationResult:
+        self.calls.append(
+            (scenario.name, starting_portfolio, valuation_provenance)
+        )
+        raise ValueError("bounded optimizer port called")
+
+
+def test_social_security_route_uses_bounded_executor_port() -> None:
+    created: list[FakeDatabase] = []
+    optimizer = _FailingSocialSecurityOptimizer()
+    application = create_app(
+        application_settings=_settings(),
+        database_factory=_database_factory(created),
+        social_security_optimizer=optimizer,
+    )
+    scenario = {
+        "name": "executor port",
+        "current_age": 62,
+        "retirement_age": 62,
+        "end_age": 63,
+        "starting_portfolio": 100,
+        "annual_spending": 1,
+        "trials": 100,
+        "household": {
+            "plan_start_date": "2026-01-02",
+            "people": [
+                {
+                    "id": "alex",
+                    "name": "Alex",
+                    "birth_date": "1964-01-02",
+                    "retirement_age_months": 62 * 12,
+                    "primary_insurance_amount_monthly": 1_000,
+                    "social_security_claim_age_months": 62 * 12,
+                }
+            ],
+        },
+        "tax_buckets": [
+            {
+                "tax_treatment": "cash",
+                "starting_balance": 100,
+            }
+        ],
+        "tax_assumptions": {
+            "ordinary_income_tax_rate": 0.2,
+            "long_term_capital_gains_tax_rate": 0.15,
+            "apply_required_minimum_distributions": False,
+            "withdrawal_order": ["cash"],
+            "retirement_surplus_destination": "cash",
+        },
+    }
+
+    with TestClient(
+        application,
+        client=("127.0.0.1", 50000),
+    ) as client:
+        response = client.post(
+            "/wealth/social-security/optimize",
+            json=scenario,
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "bounded optimizer port called"}
+    assert len(optimizer.calls) == 1
+    name, starting_portfolio, provenance = optimizer.calls[0]
+    assert (name, starting_portfolio) == ("executor port", 100)
+    assert provenance.source == "explicit_scenario_input"
+    assert provenance.source_sha256 is not None
+
+
+def test_social_security_request_body_is_bounded_before_parsing() -> None:
+    created: list[FakeDatabase] = []
+    application = create_app(
+        application_settings=_settings(),
+        api_settings=HttpApiSettings(planner_max_request_body_bytes=1024),
+        database_factory=_database_factory(created),
+    )
+
+    with TestClient(
+        application,
+        client=("127.0.0.1", 50000),
+    ) as client:
+        response = client.post(
+            "/wealth/social-security/optimize",
+            content=b"{" + b"x" * 1024 + b"}",
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == {
+        "code": "request_too_large",
+        "message": (
+            "Social Security optimization request body exceeds the configured limit"
+        ),
+    }
 
 
 def test_non_loopback_access_fails_closed_until_bearer_auth_is_configured() -> None:

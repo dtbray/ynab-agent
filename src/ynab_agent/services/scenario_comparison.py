@@ -36,8 +36,8 @@ from ynab_agent.services.wealth import ResolvedStartingPortfolio
 
 
 SCENARIO_REVISION_SCHEMA_VERSION = 1
-SCENARIO_COMPARISON_SCHEMA_VERSION = 3
-SCENARIO_COMPARISON_POLICY_VERSION = "retirement_outcomes_v2"
+SCENARIO_COMPARISON_SCHEMA_VERSION = 4
+SCENARIO_COMPARISON_POLICY_VERSION = "retirement_outcomes_v3"
 MAX_COMPARISON_ALTERNATIVES = 12
 
 
@@ -119,6 +119,8 @@ class ScenarioOutcomeMetrics(BaseModel):
     guardrail_reduction_real_p50: float | None = Field(default=None, ge=0)
     requested_annual_spending_real: float = Field(gt=0)
     lifetime_tax_real_p50: float | None = Field(default=None, ge=0)
+    lifetime_irmaa_surcharge_real_p50: float | None = Field(default=None, ge=0)
+    irmaa_exposure_probability: float | None = Field(default=None, ge=0, le=1)
     estate_value_real_p50: float = Field(ge=0)
     estate_value_real_p10: float = Field(ge=0)
     after_tax_estate_value_real_p50: float | None = Field(default=None, ge=0)
@@ -138,6 +140,8 @@ class ScenarioMetricDelta(BaseModel):
     guardrail_reduction_real_p50: float | None = None
     requested_annual_spending_real: float
     lifetime_tax_real_p50: float | None = None
+    lifetime_irmaa_surcharge_real_p50: float | None = None
+    irmaa_exposure_probability: float | None = None
     estate_value_real_p50: float
     estate_value_real_p10: float
     after_tax_estate_value_real_p50: float | None = None
@@ -338,6 +342,12 @@ class DefaultScenarioOutcomeExtractor:
                 if result.lifetime_tax_real is not None
                 else None
             ),
+            lifetime_irmaa_surcharge_real_p50=(
+                result.lifetime_irmaa_surcharge_real["p50"]
+                if result.lifetime_irmaa_surcharge_real is not None
+                else None
+            ),
+            irmaa_exposure_probability=result.irmaa_exposure_probability,
             estate_value_real_p50=result.ending_balance_real["p50"],
             estate_value_real_p10=result.ending_balance_real["p10"],
             after_tax_estate_value_real_p50=(
@@ -968,6 +978,14 @@ def _metric_delta(
             baseline.lifetime_tax_real_p50,
             alternative.lifetime_tax_real_p50,
         ),
+        lifetime_irmaa_surcharge_real_p50=_optional_delta(
+            baseline.lifetime_irmaa_surcharge_real_p50,
+            alternative.lifetime_irmaa_surcharge_real_p50,
+        ),
+        irmaa_exposure_probability=_optional_delta(
+            baseline.irmaa_exposure_probability,
+            alternative.irmaa_exposure_probability,
+        ),
         estate_value_real_p50=(
             alternative.estate_value_real_p50 - baseline.estate_value_real_p50
         ),
@@ -1045,6 +1063,8 @@ _METRIC_PREFERENCES: dict[str, int] = {
     "guardrail_reduction_real_p50": -1,
     "requested_annual_spending_real": 1,
     "lifetime_tax_real_p50": -1,
+    "lifetime_irmaa_surcharge_real_p50": -1,
+    "irmaa_exposure_probability": -1,
     "estate_value_real_p50": 1,
     "estate_value_real_p10": 1,
     "after_tax_estate_value_real_p50": 1,
@@ -1086,6 +1106,8 @@ def _material_tradeoffs(
         "guardrail_reduction_real_p50": 500.0,
         "requested_annual_spending_real": 500.0,
         "lifetime_tax_real_p50": 500.0,
+        "lifetime_irmaa_surcharge_real_p50": 250.0,
+        "irmaa_exposure_probability": 0.01,
         "estate_value_real_p50": 1_000.0,
         "estate_value_real_p10": 1_000.0,
         "after_tax_estate_value_real_p50": 1_000.0,

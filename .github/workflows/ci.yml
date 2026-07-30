@@ -25,7 +25,7 @@ jobs:
       - name: Install project
         run: |
           python -m pip install --upgrade pip
-          python -m pip install build
+          python -m pip install build twine
           python -m pip install -e ".[dev,planner,historical,reports]"
 
       - name: Compile
@@ -52,5 +52,15 @@ jobs:
             src/ynab_agent/http_api/schemas/spending_guardrails.py \
             src/ynab_agent/http_api/schemas/scenario_comparison.py
 
-      - name: Build wheel
-        run: python -m build --wheel
+      - name: Build distributions
+        run: |
+          python -m build
+          python -m twine check dist/*
+          test "$(find dist -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 1
+          test "$(find dist -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
+
+      - name: Smoke-test wheel
+        run: |
+          python -m venv /tmp/ynab-wheel-smoke
+          /tmp/ynab-wheel-smoke/bin/python -m pip install --no-deps dist/*.whl
+          /tmp/ynab-wheel-smoke/bin/ynab --help

@@ -211,6 +211,27 @@ def compare_scenario_revisions(
                 ("after_tax_estate_p10_delta", "After-Tax Estate P10 Δ"),
             ],
         )
+        render_rows(
+            [
+                {
+                    "scenario": alternative.scenario_name,
+                    "irmaa_delta": _optional_dollars(
+                        alternative.delta.lifetime_irmaa_surcharge_real_p50
+                    ),
+                    "irmaa_exposure_delta": (
+                        f"{alternative.delta.irmaa_exposure_probability:+.1%}"
+                        if alternative.delta.irmaa_exposure_probability is not None
+                        else ""
+                    ),
+                }
+                for alternative in comparison.alternatives
+            ],
+            [
+                ("scenario", "Alternative"),
+                ("irmaa_delta", "IRMAA P50 Δ"),
+                ("irmaa_exposure_delta", "IRMAA Exposure Δ"),
+            ],
+        )
         console.print(
             f"Comparison {comparison.id}; manifest "
             f"{comparison.manifest_sha256[:12]}"

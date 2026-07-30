@@ -19,6 +19,9 @@ from ynab_agent.services.planner_jobs import (
     PlannerExecutionPolicy,
     PlannerJobRepository,
 )
+from ynab_agent.services.social_security import (
+    SocialSecurityOptimizationExecutor,
+)
 from ynab_agent.workers.planner import PlannerJobWorker, PlannerRunner
 
 from .dependencies import HttpApiRuntime
@@ -28,6 +31,9 @@ from .routers.spending_guardrails import router as spending_guardrails_router
 from .routers.scenario_comparison import router as scenario_comparison_router
 from .routers.wealth import router as wealth_router
 from .settings import HttpApiSettings
+from .social_security_executor import (
+    BoundedSocialSecurityOptimizationExecutor,
+)
 
 
 def _application_version() -> str:
@@ -44,6 +50,7 @@ def create_app(
     database_factory: DatabaseFactory = DatabaseManager,
     planner_executor: Executor | None = None,
     planner_runner: PlannerRunner | None = None,
+    social_security_optimizer: SocialSecurityOptimizationExecutor | None = None,
 ) -> FastAPI:
     """Create an HTTP app with resources resolved when its lifespan starts."""
 
@@ -92,6 +99,13 @@ def create_app(
                     historical_datasets=historical_datasets,
                     planner_execution_policy=execution_policy,
                     scenario_comparison_executor=worker,
+                    social_security_optimizer=(
+                        social_security_optimizer
+                        or BoundedSocialSecurityOptimizationExecutor(
+                            worker,
+                            execution_policy,
+                        )
+                    ),
                     database_factory=database_factory,
                 )
                 runtime_installed = True
