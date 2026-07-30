@@ -4,10 +4,6 @@
 official API. It provides an OAuth-first CLI, a local SQL cache, read-only
 reporting, transaction workflows, and optional retirement-planning models.
 
-This repository is a privacy-bounded public distribution. Personal budget
-data, deployment details, local infrastructure, and generated databases are
-not part of the export.
-
 ## Highlights
 
 - OAuth Authorization Code + PKCE, with automatic token refresh
@@ -21,9 +17,6 @@ not part of the export.
 
 - Python 3.13 or newer
 - A YNAB personal access token or OAuth application
-
-YNAB credentials and budget data are sensitive. Keep `.env`, OAuth token
-files, databases, exports, and generated reports out of version control.
 
 ## Install
 
