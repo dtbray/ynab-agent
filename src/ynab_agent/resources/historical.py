@@ -41,6 +41,7 @@ class RegisteredHistoricalDatasets:
                 years=series.years,
                 nominal_returns=series.nominal_returns,
                 inflation_rates=series.inflation_rates,
+                asset_returns=series.asset_returns,
                 content_sha256=series.sha256,
                 observations_sha256=series.observations_sha256,
                 order_policy=series.order_policy,

@@ -37,6 +37,46 @@ def _scenario(name: str, starting_portfolio: float) -> dict[str, object]:
         "annual_spending": 40_000,
         "trials": 100,
         "seed": 42,
+        "portfolio_allocation": {
+            "market": {
+                "us_equity": {
+                    "expected_return": 0.08,
+                    "volatility": 0.18,
+                },
+                "international_equity": {
+                    "expected_return": 0.07,
+                    "volatility": 0.20,
+                },
+                "bonds": {
+                    "expected_return": 0.04,
+                    "volatility": 0.07,
+                },
+                "cash": {
+                    "expected_return": 0.02,
+                    "volatility": 0.01,
+                },
+                "correlation": {
+                    "values": [
+                        [1, 0, 0, 0],
+                        [0, 1, 0, 0],
+                        [0, 0, 1, 0],
+                        [0, 0, 0, 1],
+                    ]
+                },
+            },
+            "accounts": [
+                {
+                    "account_id": "portfolio",
+                    "portfolio_weight": 1,
+                    "target": {
+                        "us_equity": 0.6,
+                        "international_equity": 0.2,
+                        "bonds": 0.15,
+                        "cash": 0.05,
+                    },
+                }
+            ],
+        },
     }
 
 
@@ -71,12 +111,17 @@ def test_http_revision_and_comparison_representations_round_trip(
                 json={
                     "baseline_revision_id": baseline["id"],
                     "alternative_revision_ids": [alternative["id"]],
+                    "named_stress": "equity_crash",
                 },
             )
             assert response.status_code == 201, response.text
             comparison = ScenarioComparison.model_validate(response.json())
             assert comparison.baseline.revision_id == baseline["id"]
             assert comparison.alternatives[0].revision_id == alternative["id"]
+            assert (
+                comparison.manifest.common_paths.named_stress
+                == "equity_crash"
+            )
             assert comparison.alternatives[0].dominated_by_revision_ids == (
                 baseline["id"],
             )

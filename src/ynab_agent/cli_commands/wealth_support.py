@@ -13,6 +13,7 @@ from ynab_agent.planning.historical import (
     load_historical_series,
 )
 from ynab_agent.planning.models import ReturnModel, WealthScenario
+from ynab_agent.planning.stress import NamedStressName
 
 
 def load_scenario(scenario_path: Path) -> WealthScenario:
@@ -31,8 +32,17 @@ def load_scenario(scenario_path: Path) -> WealthScenario:
 def load_history(
     scenario: WealthScenario,
     returns_path: Path | None,
+    named_stress: NamedStressName | None = None,
 ) -> HistoricalSeries | None:
     """Load required historical observations without leaking file paths."""
+    if (
+        named_stress is not None
+        and scenario.return_model is ReturnModel.HISTORICAL_BOOTSTRAP
+    ):
+        raise typer.BadParameter(
+            "--stress cannot be combined with historical_bootstrap",
+            param_hint="--stress",
+        )
     if (
         scenario.return_model is ReturnModel.HISTORICAL_BOOTSTRAP
         and returns_path is None

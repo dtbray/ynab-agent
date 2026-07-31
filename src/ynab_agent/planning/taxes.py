@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
+from ynab_agent.planning.housing import HomeEquityCareFundingResult
 from ynab_agent.planning.models import (
     FederalFilingStatus,
     TaxAssumptions,
@@ -99,6 +100,7 @@ class TaxBucketKey:
 
     tax_treatment: TaxTreatment
     owner_person_id: str | None
+    account_id: str | None = None
 
 
 @dataclass
@@ -145,6 +147,7 @@ class TaxAwarePortfolio:
             TaxBucketKey(
                 bucket.tax_treatment,
                 bucket.owner_person_id,
+                bucket.account_id,
             ): np.full(
                 scenario.trials,
                 bucket.starting_balance,
@@ -158,7 +161,11 @@ class TaxAwarePortfolio:
                 continue
             if bucket.taxable_basis is None:  # pragma: no cover - model invariant
                 raise RuntimeError("taxable bucket is missing its basis")
-            key = TaxBucketKey(bucket.tax_treatment, bucket.owner_person_id)
+            key = TaxBucketKey(
+                bucket.tax_treatment,
+                bucket.owner_person_id,
+                bucket.account_id,
+            )
             taxable_basis[key] = np.full(
                 scenario.trials,
                 bucket.taxable_basis,
@@ -256,6 +263,30 @@ class TaxAwarePortfolio:
             axis=0,
         )
 
+    def account_balances(
+        self,
+        trial_slice: slice,
+    ) -> dict[str, np.ndarray]:
+        """Return linked balances by stable scenario account identity."""
+        import numpy as np
+
+        account_ids = {
+            key.account_id
+            for key in self.balances
+            if key.account_id is not None
+        }
+        return {
+            account_id: np.sum(
+                [
+                    balance[trial_slice]
+                    for key, balance in self.balances.items()
+                    if key.account_id == account_id
+                ],
+                axis=0,
+            )
+            for account_id in account_ids
+        }
+
     def _keys_for_treatment(
         self,
         treatment: TaxTreatment,
@@ -289,8 +320,10 @@ class TaxAwarePortfolio:
         assumptions: TaxAssumptions,
         tax_year: int,
         joint_filing: np.ndarray | None = None,
+        external_disposition_value: float | np.ndarray = 0.0,
+        external_long_term_capital_gains: float | np.ndarray = 0.0,
     ) -> np.ndarray:
-        """Return liquidation value after account-character taxes."""
+        """Return one combined liquidation value after account-character taxes."""
         import numpy as np
 
         if assumptions.progressive is not None:
@@ -311,7 +344,13 @@ class TaxAwarePortfolio:
                 aggregate_gains += (
                     taxable[trial_slice] - basis[trial_slice]
                 )
-            gains = np.maximum(0.0, aggregate_gains)
+            gains = np.maximum(0.0, aggregate_gains) + np.broadcast_to(
+                np.asarray(
+                    external_long_term_capital_gains,
+                    dtype=float,
+                ),
+                total.shape,
+            )
             liquidation_tax = (
                 calculate_income_tax_arrays(
                     assumptions.progressive,
@@ -332,9 +371,17 @@ class TaxAwarePortfolio:
                     ),
                 ).total_income_tax
             )
-            return cast("np.ndarray", total - liquidation_tax)
+            return cast(
+                "np.ndarray",
+                total + external_disposition_value - liquidation_tax,
+            )
 
         estate = np.zeros_like(self.cumulative_tax_real[trial_slice])
+        estate += (
+            external_disposition_value
+            - np.asarray(external_long_term_capital_gains, dtype=float)
+            * assumptions.long_term_capital_gains_tax_rate
+        )
         for key, all_balances in self.balances.items():
             treatment = key.tax_treatment
             balance = all_balances[trial_slice]
@@ -363,11 +410,22 @@ class TaxAwarePortfolio:
         trial_slice: slice,
         gross_return: np.ndarray,
         *,
+        account_gross_returns: dict[str, np.ndarray] | None = None,
         inflation_factor: float | np.ndarray,
         assumptions: TaxAssumptions,
     ) -> None:
-        for balance in self.balances.values():
-            balance[trial_slice] *= gross_return
+        for key, balance in self.balances.items():
+            selected_return = gross_return
+            if (
+                key.account_id is not None
+                and account_gross_returns is not None
+            ):
+                if key.account_id not in account_gross_returns:
+                    raise ValueError(
+                        "linked tax bucket is missing its account return"
+                    )
+                selected_return = account_gross_returns[key.account_id]
+            balance[trial_slice] *= selected_return
         taxable_keys = self._keys_for_treatment(TaxTreatment.TAXABLE)
         if not taxable_keys or assumptions.taxable_account_annual_tax_drag_rate == 0:
             return
@@ -401,9 +459,105 @@ class TaxAwarePortfolio:
                 TaxBucketKey(
                     bucket.tax_treatment,
                     bucket.owner_person_id,
+                    bucket.account_id,
                 ),
                 amount * bucket.contribution_fraction,
             )
+
+    def _key_for_account(self, account_id: str) -> TaxBucketKey:
+        keys = tuple(
+            key
+            for key in self.balances
+            if key.account_id == account_id
+        )
+        if len(keys) != 1:
+            raise ValueError(
+                "account_id must identify exactly one linked tax bucket"
+            )
+        return keys[0]
+
+    def deposit_external_cash_to_account(
+        self,
+        trial_slice: slice,
+        *,
+        account_id: str,
+        amount: float | np.ndarray,
+    ) -> TaxBucketKey:
+        """Deposit external proceeds into one exact cash or taxable account."""
+        key = self._key_for_account(account_id)
+        if key.tax_treatment not in {
+            TaxTreatment.CASH,
+            TaxTreatment.TAXABLE,
+        }:
+            raise ValueError(
+                "external cash destination account must be cash or taxable"
+            )
+        self._deposit_key(trial_slice, key, amount)
+        return key
+
+    def account_balance_and_basis(
+        self,
+        trial_slice: slice,
+        *,
+        account_id: str,
+    ) -> tuple[TaxBucketKey, np.ndarray, np.ndarray | None]:
+        """Return copied exact-account state for deterministic audit output."""
+        key = self._key_for_account(account_id)
+        basis = self.taxable_basis.get(key)
+        return (
+            key,
+            self.balances[key][trial_slice].copy(),
+            basis[trial_slice].copy() if basis is not None else None,
+        )
+
+    def fund_home_equity_care(
+        self,
+        trial_slice: slice,
+        *,
+        account_id: str,
+        requested: float | np.ndarray,
+    ) -> HomeEquityCareFundingResult:
+        """Debit care from one exact realized-equity account, fail closed."""
+        import numpy as np
+
+        key = self._key_for_account(account_id)
+        if key.tax_treatment not in {
+            TaxTreatment.CASH,
+            TaxTreatment.TAXABLE,
+        }:
+            raise ValueError(
+                "home-equity care funding account must be cash or taxable"
+            )
+        balance = self.balances[key][trial_slice]
+        request = np.broadcast_to(
+            np.asarray(requested, dtype=float),
+            balance.shape,
+        )
+        funded = np.minimum(balance, request)
+        realized_gains = np.zeros_like(funded)
+        if key.tax_treatment is TaxTreatment.TAXABLE:
+            basis = self.taxable_basis.get(key)
+            if basis is None:  # pragma: no cover - model invariant
+                raise RuntimeError("taxable balance is missing its basis")
+            basis_slice = basis[trial_slice]
+            basis_ratio = np.divide(
+                basis_slice,
+                balance,
+                out=np.zeros_like(balance),
+                where=balance > 0,
+            )
+            basis_reduction = np.minimum(
+                basis_slice,
+                funded * basis_ratio,
+            )
+            realized_gains = np.maximum(0.0, funded - basis_reduction)
+            basis_slice -= basis_reduction
+        balance -= funded
+        return HomeEquityCareFundingResult(
+            funded=funded,
+            unmet=np.maximum(0.0, request - funded),
+            realized_long_term_capital_gains=realized_gains,
+        )
 
     def fund_retirement_spending(
         self,
@@ -418,6 +572,7 @@ class TaxAwarePortfolio:
         opening_tax_deferred: dict[TaxBucketKey, np.ndarray],
         inflation_factor: float | np.ndarray,
         assumptions: TaxAssumptions,
+        external_long_term_capital_gains: float | np.ndarray = 0.0,
         joint_filing: np.ndarray | None = None,
         tax_engine: HouseholdTaxEngine | None = None,
         owner_birth_years: dict[str, int] | None = None,
@@ -448,6 +603,9 @@ class TaxAwarePortfolio:
                 ordinary_income=ordinary,
                 social_security_income=social_security,
                 tax_free_income=tax_free,
+                external_long_term_capital_gains=(
+                    external_long_term_capital_gains
+                ),
                 inflation_factor=inflation_factor,
                 assumptions=assumptions,
                 joint_filing=joint_filing,
@@ -470,7 +628,13 @@ class TaxAwarePortfolio:
                     else joint_filing
                 ),
                 tax_year=tax_year,
-                long_term_capital_gains=np.zeros_like(ordinary),
+                long_term_capital_gains=np.broadcast_to(
+                    np.asarray(
+                        external_long_term_capital_gains,
+                        dtype=float,
+                    ),
+                    ordinary.shape,
+                ),
             ),
             assumptions=assumptions,
         )
@@ -555,6 +719,7 @@ class TaxAwarePortfolio:
         ordinary_income: np.ndarray,
         social_security_income: np.ndarray,
         tax_free_income: np.ndarray,
+        external_long_term_capital_gains: float | np.ndarray,
         inflation_factor: float | np.ndarray,
         assumptions: TaxAssumptions,
         joint_filing: np.ndarray | None,
@@ -569,6 +734,13 @@ class TaxAwarePortfolio:
             raise RuntimeError("progressive tax assumptions are missing")
         shape = self.cumulative_tax_real[trial_slice].shape
         zeros = np.zeros(shape, dtype=float)
+        base_gains = np.broadcast_to(
+            np.asarray(
+                external_long_term_capital_gains,
+                dtype=float,
+            ),
+            shape,
+        ).astype(float, copy=True)
         ordinary = np.broadcast_to(
             ordinary_income,
             shape,
@@ -588,7 +760,7 @@ class TaxAwarePortfolio:
                 joint_filing=joint_filing,
                 tax_engine=tax_engine,
                 owner_birth_years=owner_birth_years,
-                initial_gains=zeros,
+                initial_gains=base_gains,
                 noncash_ordinary_income=zeros,
             )
 
@@ -666,8 +838,19 @@ class TaxAwarePortfolio:
                     key
                     for key in roth_keys
                     if key.owner_person_id == source.owner_person_id
+                    and (
+                        key.account_id == source.account_id
+                        or source.account_id is None
+                    )
                 ),
-                None,
+                next(
+                    (
+                        key
+                        for key in roth_keys
+                        if key.owner_person_id == source.owner_person_id
+                    ),
+                    None,
+                ),
             )
 
         def convertible_tax_deferred_balance() -> np.ndarray:
@@ -733,7 +916,7 @@ class TaxAwarePortfolio:
                 joint_filing=joint_filing,
                 tax_engine=tax_engine,
                 owner_birth_years=owner_birth_years,
-                initial_gains=harvest,
+                initial_gains=base_gains + harvest,
                 noncash_ordinary_income=conversion,
             )
             adjusted_gross_income = (
@@ -811,7 +994,8 @@ class TaxAwarePortfolio:
             tax_engine=tax_engine,
             owner_birth_years=owner_birth_years,
             initial_gains=(
-                decision.harvested_long_term_capital_gains
+                base_gains
+                + decision.harvested_long_term_capital_gains
             ),
             noncash_ordinary_income=decision.roth_conversion,
         )
@@ -1273,9 +1457,9 @@ def estimate_tax_state_bytes(scenario: WealthScenario) -> int:
         scenario.tax_assumptions is not None
         and scenario.tax_assumptions.tax_model is TaxModel.PROGRESSIVE_US_INDIANA
     ):
-        # Bisections plus starting/projected owner balances, withdrawal ledgers,
-        # and starting/projected taxable bases.
-        array_count += 14 + 3 * bucket_count + 2 * taxable_count
+        # Bisections, external-gain state, starting/projected owner balances,
+        # withdrawal ledgers, and starting/projected taxable bases.
+        array_count += 15 + 3 * bucket_count + 2 * taxable_count
     if (
         scenario.tax_assumptions is not None
         and scenario.tax_assumptions.strategy is not None

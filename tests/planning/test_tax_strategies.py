@@ -729,7 +729,7 @@ def test_strategy_resource_estimates_include_bounded_decision_searches() -> None
         (3 * bucket_count)
         + 17
         + taxable_count
-        + 14
+        + 15
         + (3 * bucket_count)
         + (2 * taxable_count)
     )

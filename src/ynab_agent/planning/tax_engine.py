@@ -46,7 +46,7 @@ class HouseholdTaxEngine(Protocol):
 class EffectiveRateHouseholdTaxEngine:
     """Existing effective-rate behavior behind the household tax port."""
 
-    engine_id = "effective_rate_household_v1"
+    engine_id = "effective_rate_household_v2"
 
     def income_tax(
         self,
@@ -60,6 +60,9 @@ class EffectiveRateHouseholdTaxEngine:
             tax_input.ordinary_income
             + tax_input.social_security_income
             * assumptions.social_security_taxable_fraction
+        ) + (
+            tax_input.long_term_capital_gains
+            * assumptions.long_term_capital_gains_tax_rate
         )
 
 

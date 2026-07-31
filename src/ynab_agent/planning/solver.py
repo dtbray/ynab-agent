@@ -18,6 +18,7 @@ from ynab_agent.planning.simulation import (
     score_simulation,
     simulate,
 )
+from ynab_agent.planning.stress import NamedStressName
 
 
 class SolveVariable(StrEnum):
@@ -60,6 +61,7 @@ def solve_scenario(
     historical_series: HistoricalSeries | None = None,
     valuation_provenance: ValuationProvenance | None = None,
     run_policy: RunPolicy | None = None,
+    named_stress: NamedStressName | None = None,
 ) -> SolveResult:
     """Find a conservative monotone threshold using common seeded return paths."""
     if not 0 < target_success_rate < 1:
@@ -93,12 +95,29 @@ def solve_scenario(
         historical_source = historical_series.source
         historical_fingerprint = historical_series.sha256
 
-    paths = prepare_simulation_paths(
-        scenario,
-        historical_returns=historical_returns,
-        historical_inflation=historical_inflation,
-        run_policy=run_policy,
+    historical_asset_returns = (
+        historical_series.asset_returns
+        if historical_series is not None
+        else None
     )
+    if historical_asset_returns is not None or named_stress is not None:
+        paths = prepare_simulation_paths(
+            scenario,
+            historical_returns=historical_returns,
+            historical_inflation=historical_inflation,
+            historical_asset_returns=historical_asset_returns,
+            named_stress=named_stress,
+            run_policy=run_policy,
+        )
+    else:
+        # Preserve the established adapter call for compatible path sources
+        # and tests that wrap the legacy signature.
+        paths = prepare_simulation_paths(
+            scenario,
+            historical_returns=historical_returns,
+            historical_inflation=historical_inflation,
+            run_policy=run_policy,
+        )
     try:
         return _solve_prepared(
             scenario,

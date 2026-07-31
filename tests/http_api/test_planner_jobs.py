@@ -22,6 +22,7 @@ from ynab_agent.services.planner_jobs import (
     PlannerGoalOutcome,
     PlannerJobPayload,
     PlannerSimulationResult,
+    run_planner_job,
 )
 
 
@@ -211,6 +212,160 @@ def test_submit_is_idempotent_and_returns_typed_result_location(
             assert duplicate.json()["duplicate"] is True
             assert duplicate.json()["job_id"] == accepted["job_id"]
             assert duplicate.headers["location"] == accepted["result_url"]
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_http_job_preserves_healthcare_result_contract(
+    tmp_path: Path,
+) -> None:
+    scenario = {
+        "name": "HTTP healthcare",
+        "current_age": 64,
+        "retirement_age": 64,
+        "end_age": 67,
+        "starting_portfolio": 100_000,
+        "annual_spending": 1,
+        "accounts": [
+            {
+                "id": "home-reserve",
+                "role": "taxable",
+                "owner_person_id": "alex",
+            },
+            {
+                "id": "cash",
+                "role": "cash",
+                "owner_person_id": "alex",
+            },
+        ],
+        "tax_buckets": [
+            {
+                "account_id": "home-reserve",
+                "owner_person_id": "alex",
+                "tax_treatment": "taxable",
+                "starting_balance": 0,
+                "taxable_basis": 0,
+            },
+            {
+                "account_id": "cash",
+                "owner_person_id": "alex",
+                "tax_treatment": "cash",
+                "starting_balance": 100_000,
+            },
+        ],
+        "tax_assumptions": {
+            "ordinary_income_tax_rate": 0,
+            "long_term_capital_gains_tax_rate": 0,
+            "apply_required_minimum_distributions": False,
+            "withdrawal_order": ["taxable", "cash"],
+            "retirement_surplus_destination": "cash",
+        },
+        "housing_plan": {
+            "home": {
+                "current_value": 5_000,
+                "cost_basis": 5_000,
+                "annual_appreciation_rate": 0,
+                "maintenance_rate": 0,
+                "property_tax_rate": 0,
+                "insurance_rate": 0,
+                "selling_cost_rate": 0,
+            },
+            "decision": {
+                "kind": "sell",
+                "event_age": 64,
+                "proceeds_destination_account_id": "home-reserve",
+            },
+            "care": {"funding_account_id": "home-reserve"},
+        },
+        "return_mean": 0,
+        "return_volatility": 0,
+        "inflation_rate": 0,
+        "annual_fee_rate": 0,
+        "trials": 100,
+        "seed": 18,
+        "household": {
+            "plan_start_date": "2026-01-02",
+            "people": [
+                {
+                    "id": "alex",
+                    "name": "Alex",
+                    "birth_date": "1962-01-02",
+                    "retirement_age_months": 64 * 12,
+                    "longevity": {
+                        "mode": "deterministic",
+                        "death_age": 90,
+                    },
+                }
+            ],
+        },
+        "healthcare": {
+            "medical_inflation_rate": 0,
+            "ltc_funding_source": "home_equity",
+            "home_equity_available_for_ltc_real": 5_000,
+            "people": [
+                {
+                    "person_id": "alex",
+                    "pre_medicare_aca_annual_premium_real": 2_000,
+                    "long_term_care": {
+                        "lifetime_incidence_probability": 1,
+                        "minimum_onset_age": 64,
+                        "maximum_onset_age": 64,
+                        "mean_duration_years": 1,
+                        "duration_standard_deviation_years": 0,
+                        "maximum_duration_years": 1,
+                        "annual_cost_real": 5_000,
+                    },
+                }
+            ],
+        },
+    }
+    application_settings = _database_settings(
+        tmp_path,
+        "http-healthcare.db",
+    )
+    executor = ThreadPoolExecutor(max_workers=1)
+    application = create_app(
+        application_settings=application_settings,
+        api_settings=_api_settings(),
+        planner_executor=executor,
+        planner_runner=run_planner_job,
+    )
+    try:
+        with TestClient(
+            application,
+            client=("127.0.0.1", 50000),
+        ) as client:
+            accepted = client.post(
+                "/planner/jobs",
+                json={"scenario": scenario},
+            )
+            assert accepted.status_code == 202
+            terminal = _wait_for_terminal(
+                client,
+                accepted.json()["status_url"],
+            )
+            assert terminal["state"] == "succeeded"
+            response = client.get(accepted.json()["result_url"])
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["result"]["healthcare_metrics"][
+            "ltc_in_plan_incidence_probability"
+        ] == 1
+        assert payload["result"]["annual_healthcare_real"][0][
+            "ltc_active_trials"
+        ] == 100
+        assert payload["result"]["annual_housing"][0][
+            "care_funded_from_home_equity_nominal"
+        ]["p50"] == 5_000
+        assert payload["result"]["healthcare_metrics"][
+            "lifetime_ltc_home_equity_used_real"
+        ]["p50"] == 5_000
+        assert payload["manifest"]["healthcare"]["assumptions"] == (
+            WealthScenario.model_validate(scenario).healthcare.model_dump(
+                mode="json"
+            )
+        )
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 

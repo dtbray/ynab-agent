@@ -14,12 +14,19 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from ynab_agent.planning.allocation import (
+    ASSET_CLASS_COUNT,
+    estimate_allocation_state_bytes,
+)
 from ynab_agent.planning.historical import (
+    AssetHistoricalReturns,
     HistoricalGapPolicy,
     HistoricalOrderPolicy,
     HistoricalSeries,
 )
 from ynab_agent.planning.household import estimate_household_state_bytes
+from ynab_agent.planning.healthcare import estimate_healthcare_state_bytes
+from ynab_agent.planning.housing import estimate_housing_state_bytes
 from ynab_agent.planning.models import (
     ReturnModel,
     TaxTreatment,
@@ -52,10 +59,14 @@ from ynab_agent.planning.taxes import (
     estimate_tax_state_bytes,
 )
 from ynab_agent.planning.tax_strategies import TAX_STRATEGY_EVALUATIONS_PER_YEAR
-from ynab_agent.services.wealth import WealthService
+from ynab_agent.planning.stress import NamedStressName
+from ynab_agent.services.wealth import (
+    WealthService,
+    validate_linked_account_values,
+)
 
 
-PLANNER_JOB_REQUEST_SCHEMA_VERSION = 4
+PLANNER_JOB_REQUEST_SCHEMA_VERSION = 8
 DEFAULT_MAXIMUM_COMPUTE_UNITS = 200_000_000
 MAX_HISTORICAL_OBSERVATIONS = 10_000
 
@@ -160,6 +171,7 @@ class HistoricalDatasetSnapshot(BaseModel):
         default=None,
         max_length=MAX_HISTORICAL_OBSERVATIONS,
     )
+    asset_returns: AssetHistoricalReturns | None = None
     content_sha256: str = Field(min_length=64, max_length=64)
     observations_sha256: str = Field(min_length=64, max_length=64)
     order_policy: HistoricalOrderPolicy
@@ -170,6 +182,7 @@ class HistoricalDatasetSnapshot(BaseModel):
             years=self.years,
             nominal_returns=self.nominal_returns,
             inflation_rates=self.inflation_rates,
+            asset_returns=self.asset_returns,
             source=f"registered:{self.dataset_id}",
             sha256=self.content_sha256,
             observations_sha256=self.observations_sha256,
@@ -239,6 +252,16 @@ class PlannerExecutionPolicy(BaseModel):
                 else 0
             )
             + estimate_household_state_bytes(scenario)
+            + estimate_healthcare_state_bytes(scenario)
+            + estimate_housing_state_bytes(
+                scenario.trials,
+                scenario.housing_plan is not None,
+            )
+            + estimate_allocation_state_bytes(
+                scenario.portfolio_allocation,
+                scenario.trials,
+                batch_size=self.batch_size,
+            )
         )
         if required_bytes > self.maximum_working_bytes:
             raise ResourceLimitError(
@@ -338,6 +361,25 @@ class PlannerExecutionPolicy(BaseModel):
                 if scenario.household is not None
                 else 0
             )
+            + (
+                sum(
+                    3
+                    + (
+                        6
+                        if person.long_term_care is not None
+                        else 0
+                    )
+                    for person in scenario.healthcare.people
+                )
+                if scenario.healthcare is not None
+                else 0
+            )
+            + (
+                len(scenario.portfolio_allocation.accounts)
+                * ASSET_CLASS_COUNT
+                if scenario.portfolio_allocation is not None
+                else 0
+            )
         )
         tax_assumptions = scenario.tax_assumptions
         progressive = (
@@ -431,6 +473,7 @@ class PlannerJobSubmission(BaseModel):
         min_length=1,
         max_length=64,
     )
+    named_stress: NamedStressName | None = None
 
 
 class PlannerJobPayload(BaseModel):
@@ -447,6 +490,7 @@ class PlannerJobPayload(BaseModel):
     starting_portfolio: float = Field(ge=0)
     valuation_provenance: ValuationProvenance
     historical_dataset: HistoricalDatasetSnapshot | None = None
+    named_stress: NamedStressName | None = None
     execution_policy: PlannerExecutionPolicy
     required_working_bytes: int = Field(gt=0)
 
@@ -462,6 +506,42 @@ class PlannerJobPayload(BaseModel):
             raise ValueError("historical jobs require a registered dataset snapshot")
         if not historical and self.historical_dataset is not None:
             raise ValueError("lognormal jobs cannot include historical data")
+        if (
+            historical
+            and self.scenario.portfolio_allocation is not None
+            and self.historical_dataset is not None
+            and self.historical_dataset.asset_returns is None
+        ):
+            raise ValueError(
+                "multi-asset historical jobs require four asset return series"
+            )
+        linked_accounts = any(
+            bucket.account_id is not None
+            for bucket in self.scenario.tax_buckets
+        )
+        if (
+            self.scenario.starting_portfolio is None
+            and linked_accounts
+            and not self.valuation_provenance.account_values
+        ):
+            raise ValueError(
+                "live linked planner jobs require persisted account values"
+            )
+        if self.valuation_provenance.account_values:
+            validate_linked_account_values(
+                self.scenario,
+                self.valuation_provenance.account_values,
+                resolved_total=self.starting_portfolio,
+            )
+        if self.named_stress is not None:
+            if historical:
+                raise ValueError(
+                    "named stresses cannot be combined with historical jobs"
+                )
+            if self.scenario.portfolio_allocation is None:
+                raise ValueError(
+                    "named stresses require portfolio_allocation assumptions"
+                )
         return self
 
 
@@ -498,6 +578,8 @@ class PlannerSimulationResult(BaseModel):
     irmaa_exposure_probability: float | None = Field(default=None, ge=0, le=1)
     annual_tax_audit: list[dict[str, object]] = Field(default_factory=list)
     annual_tax_strategy_actions: list[dict[str, object]] = Field(default_factory=list)
+    annual_housing: list[dict[str, object]] = Field(default_factory=list)
+    housing_manifest: dict[str, object] | None = None
     annual_balance_real: list[dict[str, float | int]]
     funded_spending_ratio: dict[str, float] = Field(
         default_factory=lambda: {"p10": 1.0, "p50": 1.0, "p90": 1.0}
@@ -513,6 +595,8 @@ class PlannerSimulationResult(BaseModel):
     recovered_trials: int = 0
     recovery_probability: float | None = None
     after_tax_ending_balance_real: dict[str, float] | None = None
+    estate_value_real: dict[str, float] | None = None
+    after_tax_estate_value_real: dict[str, float] | None = None
     legacy_target_probability: float | None = None
     goal_outcomes: list[PlannerGoalOutcome] = Field(default_factory=list)
     annual_spending_real: list[dict[str, object]] = Field(
@@ -520,6 +604,13 @@ class PlannerSimulationResult(BaseModel):
     )
     guardrail_metrics: dict[str, object] | None = None
     household_cash_flow_audit: list[dict[str, object]] = Field(default_factory=list)
+    annual_allocation_real: list[dict[str, object]] = Field(
+        default_factory=list,
+    )
+    annual_healthcare_real: list[dict[str, object]] = Field(
+        default_factory=list,
+    )
+    healthcare_metrics: dict[str, object] | None = None
     assumptions: dict[str, bool | float | int | str]
     engine: dict[str, str | int]
     reproducibility: dict[str, object]
@@ -658,6 +749,7 @@ def run_planner_job(payload_json: str) -> str:
         payload.scenario,
         payload.starting_portfolio,
         historical_series=historical_series,
+        named_stress=payload.named_stress,
         valuation_provenance=payload.valuation_provenance,
         run_policy=payload.execution_policy.to_run_policy(),
     )
@@ -698,6 +790,16 @@ class PlannerJobService:
                 PlannerErrorCode.INVALID_JOB,
                 "historical block size exceeds the registered dataset",
             )
+        if (
+            dataset is not None
+            and submission.scenario.portfolio_allocation is not None
+            and dataset.asset_returns is None
+        ):
+            raise PlannerJobServiceError(
+                PlannerErrorCode.INVALID_JOB,
+                "multi-asset historical simulations require a registered "
+                "dataset with all four asset return columns",
+            )
         try:
             resolved = await self.wealth_service.resolve_starting_portfolio_with_provenance(
                 submission.scenario
@@ -723,6 +825,7 @@ class PlannerJobService:
             starting_portfolio=resolved.value,
             valuation_provenance=resolved.provenance,
             historical_dataset=dataset,
+            named_stress=submission.named_stress,
             execution_policy=self.execution_policy,
             required_working_bytes=required_working_bytes,
         )
@@ -813,6 +916,19 @@ class PlannerJobService:
     ) -> HistoricalDatasetSnapshot | None:
         is_historical = submission.scenario.return_model is ReturnModel.HISTORICAL_BOOTSTRAP
         dataset_id = submission.historical_dataset_id
+        if is_historical and submission.named_stress is not None:
+            raise PlannerJobServiceError(
+                PlannerErrorCode.INVALID_JOB,
+                "named stresses cannot be combined with historical simulations",
+            )
+        if (
+            submission.named_stress is not None
+            and submission.scenario.portfolio_allocation is None
+        ):
+            raise PlannerJobServiceError(
+                PlannerErrorCode.INVALID_JOB,
+                "named stresses require portfolio allocation assumptions",
+            )
         if is_historical and dataset_id is None:
             raise PlannerJobServiceError(
                 PlannerErrorCode.HISTORICAL_DATASET_REQUIRED,

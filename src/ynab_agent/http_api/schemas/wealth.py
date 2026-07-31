@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from ynab_agent.planning.models import (
+    AccountValuationInput,
     CashFlowStream,
     CashFlowType,
     ValuationProvenance,
@@ -156,6 +157,7 @@ class ValuationProvenanceRead(BaseModel):
     source: str
     as_of: date | None
     account_ids: tuple[str, ...]
+    account_values: tuple[AccountValuationInput, ...]
     source_sha256: str | None
 
     @classmethod

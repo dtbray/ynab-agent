@@ -141,5 +141,9 @@ def tax_strategy_manifest(
         "decision_timing": "after_current_year_return_joint_with_current_year_withdrawals",
         "future_path_information_used": False,
         "strategy": strategy.model_dump(mode="json"),
-        "asset_location_execution": "typed_advisory_hook",
+        "asset_location_execution": (
+            "capacity_constrained_preference_priority_v1"
+            if strategy.asset_location_preferences
+            else "not_configured"
+        ),
     }

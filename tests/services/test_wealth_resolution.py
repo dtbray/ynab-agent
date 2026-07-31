@@ -4,6 +4,8 @@ import asyncio
 from collections.abc import Collection, Sequence
 from datetime import date
 
+import pytest
+
 from ynab_agent.planning.models import WealthScenario
 from ynab_agent.services.wealth import (
     AccountFreshness,
@@ -117,6 +119,13 @@ async def _resolve_cached() -> None:
     assert first.provenance.source == "cached_liquid_accounts"
     assert first.provenance.as_of is None
     assert first.provenance.account_ids == ("retirement", "taxable")
+    assert [
+        (value.account_id, value.value)
+        for value in first.provenance.account_values
+    ] == [
+        ("retirement", 100_000),
+        ("taxable", 25_000),
+    ]
     assert first.provenance.source_sha256 == reordered.provenance.source_sha256
     assert first.provenance.source_sha256 is not None
     assert len(first.provenance.source_sha256) == 64
@@ -124,6 +133,143 @@ async def _resolve_cached() -> None:
 
 def test_cached_liquid_accounts_have_stable_input_provenance() -> None:
     asyncio.run(_resolve_cached())
+
+
+@pytest.mark.asyncio
+async def test_live_linked_account_values_fail_closed_and_are_persisted() -> None:
+    accounts = (
+        WealthAccount(
+            id="retirement",
+            name="Retirement",
+            type="otherAsset",
+            on_budget=False,
+            balance_milliunits=100_000_000,
+            closed=False,
+            deleted=False,
+            last_reconciled_at=None,
+        ),
+        WealthAccount(
+            id="taxable",
+            name="Taxable",
+            type="otherAsset",
+            on_budget=False,
+            balance_milliunits=25_000_000,
+            closed=False,
+            deleted=False,
+            last_reconciled_at=None,
+        ),
+    )
+    scenario = WealthScenario.model_validate(
+        {
+            "name": "live linked",
+            "current_age": 60,
+            "retirement_age": 60,
+            "end_age": 61,
+            "accounts": [
+                {"id": "retirement", "role": "retirement"},
+                {"id": "taxable", "role": "taxable"},
+            ],
+            "annual_spending": 1,
+            "starting_portfolio": None,
+            "trials": 100,
+            "portfolio_allocation": {
+                "market": {
+                    "us_equity": {
+                        "expected_return": 0.08,
+                        "volatility": 0.18,
+                    },
+                    "international_equity": {
+                        "expected_return": 0.07,
+                        "volatility": 0.20,
+                    },
+                    "bonds": {
+                        "expected_return": 0.04,
+                        "volatility": 0.07,
+                    },
+                    "cash": {
+                        "expected_return": 0.02,
+                        "volatility": 0.01,
+                    },
+                    "correlation": {
+                        "values": [
+                            [1, 0, 0, 0],
+                            [0, 1, 0, 0],
+                            [0, 0, 1, 0],
+                            [0, 0, 0, 1],
+                        ]
+                    },
+                },
+                "accounts": [
+                    {
+                        "account_id": "retirement",
+                        "portfolio_weight": 0.8,
+                        "target": {
+                            "us_equity": 0.6,
+                            "international_equity": 0.2,
+                            "bonds": 0.15,
+                            "cash": 0.05,
+                        },
+                    },
+                    {
+                        "account_id": "taxable",
+                        "portfolio_weight": 0.2,
+                        "target": {
+                            "us_equity": 0.6,
+                            "international_equity": 0.2,
+                            "bonds": 0.15,
+                            "cash": 0.05,
+                        },
+                    },
+                ],
+            },
+            "tax_buckets": [
+                {
+                    "tax_treatment": "tax_deferred",
+                    "account_id": "retirement",
+                    "starting_balance": 100_000,
+                },
+                {
+                    "tax_treatment": "taxable",
+                    "account_id": "taxable",
+                    "starting_balance": 25_000,
+                    "taxable_basis": 20_000,
+                },
+            ],
+            "tax_assumptions": {
+                "ordinary_income_tax_rate": 0.2,
+                "long_term_capital_gains_tax_rate": 0.15,
+                "apply_required_minimum_distributions": False,
+                "withdrawal_order": ["taxable", "tax_deferred"],
+                "retirement_surplus_destination": "taxable",
+            },
+        }
+    )
+    resolved = await WealthService(
+        _Repository(accounts)
+    ).resolve_starting_portfolio_with_provenance(scenario)
+
+    assert resolved.value == 125_000
+    assert {
+        value.account_id: value.value
+        for value in resolved.provenance.account_values
+    } == {
+        "retirement": 100_000,
+        "taxable": 25_000,
+    }
+
+    changed_accounts = (
+        accounts[0],
+        WealthAccount(
+            **{
+                **accounts[1].__dict__,
+                "balance_milliunits": 20_000_000,
+            }
+        ),
+    )
+    with pytest.raises(ValueError, match="does not match resolved"):
+        await WealthService(
+            _Repository(changed_accounts)
+        ).resolve_starting_portfolio_with_provenance(scenario)
 
 
 async def _project_cached_mortgage() -> None:

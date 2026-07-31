@@ -36,6 +36,202 @@ def _scenario(**overrides) -> WealthScenario:
     return WealthScenario.model_validate(values)
 
 
+def _allocation() -> dict[str, object]:
+    return {
+        "market": {
+            "us_equity": {"expected_return": 0.08, "volatility": 0.18},
+            "international_equity": {
+                "expected_return": 0.07,
+                "volatility": 0.2,
+            },
+            "bonds": {"expected_return": 0.04, "volatility": 0.07},
+            "cash": {"expected_return": 0.02, "volatility": 0.01},
+            "correlation": {
+                "values": [
+                    [1, 0, 0, 0],
+                    [0, 1, 0, 0],
+                    [0, 0, 1, 0],
+                    [0, 0, 0, 1],
+                ]
+            },
+        },
+        "accounts": [
+            {
+                "account_id": "portfolio",
+                "portfolio_weight": 1,
+                "target": {
+                    "us_equity": 0.6,
+                    "international_equity": 0.2,
+                    "bonds": 0.15,
+                    "cash": 0.05,
+                },
+            }
+        ],
+    }
+
+
+def test_cli_runs_named_multi_asset_stress(tmp_path: Path) -> None:
+    scenario_path = tmp_path / "stress.local.json"
+    scenario_path.write_text(
+        json.dumps(
+            _scenario(
+                portfolio_allocation=_allocation(),
+            ).model_dump(mode="json")
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "wealth",
+            "simulate",
+            "--scenario",
+            str(scenario_path),
+            "--stress",
+            "equity_crash",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["assumptions"]["named_stress"] == "equity_crash"
+    assert payload["reproducibility"]["multi_asset_paths"][
+        "source_name"
+    ] == "named_stress_catalog_v1:equity_crash"
+
+
+def test_cli_emits_healthcare_ltc_metrics_and_manifest(
+    tmp_path: Path,
+) -> None:
+    scenario = _scenario(
+        current_age=64,
+        retirement_age=64,
+        end_age=67,
+        annual_contribution=0,
+        starting_portfolio=100_000,
+        accounts=[
+            {
+                "id": "home-reserve",
+                "role": "taxable",
+                "owner_person_id": "alex",
+            },
+            {
+                "id": "cash",
+                "role": "cash",
+                "owner_person_id": "alex",
+            },
+        ],
+        tax_buckets=[
+            {
+                "account_id": "home-reserve",
+                "owner_person_id": "alex",
+                "tax_treatment": "taxable",
+                "starting_balance": 0,
+                "taxable_basis": 0,
+            },
+            {
+                "account_id": "cash",
+                "owner_person_id": "alex",
+                "tax_treatment": "cash",
+                "starting_balance": 100_000,
+            },
+        ],
+        tax_assumptions={
+            "ordinary_income_tax_rate": 0,
+            "long_term_capital_gains_tax_rate": 0,
+            "apply_required_minimum_distributions": False,
+            "withdrawal_order": ["taxable", "cash"],
+            "retirement_surplus_destination": "cash",
+        },
+        housing_plan={
+            "home": {
+                "current_value": 5_000,
+                "cost_basis": 5_000,
+                "annual_appreciation_rate": 0,
+                "maintenance_rate": 0,
+                "property_tax_rate": 0,
+                "insurance_rate": 0,
+                "selling_cost_rate": 0,
+            },
+            "decision": {
+                "kind": "sell",
+                "event_age": 64,
+                "proceeds_destination_account_id": "home-reserve",
+            },
+            "care": {"funding_account_id": "home-reserve"},
+        },
+        household={
+            "plan_start_date": "2026-01-02",
+            "people": [
+                {
+                    "id": "alex",
+                    "name": "Alex",
+                    "birth_date": "1962-01-02",
+                    "retirement_age_months": 64 * 12,
+                    "longevity": {
+                        "mode": "deterministic",
+                        "death_age": 90,
+                    },
+                }
+            ],
+        },
+        healthcare={
+            "medical_inflation_rate": 0,
+            "ltc_funding_source": "home_equity",
+            "home_equity_available_for_ltc_real": 5_000,
+            "people": [
+                {
+                    "person_id": "alex",
+                    "pre_medicare_aca_annual_premium_real": 2_000,
+                    "long_term_care": {
+                        "lifetime_incidence_probability": 1,
+                        "minimum_onset_age": 64,
+                        "maximum_onset_age": 64,
+                        "mean_duration_years": 1,
+                        "duration_standard_deviation_years": 0,
+                        "maximum_duration_years": 1,
+                        "annual_cost_real": 5_000,
+                    },
+                }
+            ],
+        },
+    )
+    scenario_path = tmp_path / "healthcare.local.json"
+    scenario_path.write_text(
+        scenario.model_dump_json(),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "wealth",
+            "simulate",
+            "--scenario",
+            str(scenario_path),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["healthcare_metrics"][
+        "ltc_in_plan_incidence_probability"
+    ] == 1
+    assert payload["annual_healthcare_real"][0]["ltc_active_trials"] == 100
+    assert payload["annual_housing"][0][
+        "care_funded_from_home_equity_nominal"
+    ]["p50"] == 5_000
+    assert payload["healthcare_metrics"][
+        "lifetime_ltc_home_equity_used_real"
+    ]["p50"] == 5_000
+    assert payload["reproducibility"]["healthcare"]["assumptions"] == (
+        scenario.healthcare.model_dump(mode="json")
+    )
+
+
 def test_cli_saves_and_compares_immutable_scenario_revisions(
     monkeypatch,
     tmp_path,
@@ -54,11 +250,19 @@ def test_cli_saves_and_compares_immutable_scenario_revisions(
     baseline_path = tmp_path / "baseline.local.json"
     alternative_path = tmp_path / "alternative.local.json"
     baseline_path.write_text(
-        _scenario(name="Baseline", starting_portfolio=100_000).model_dump_json(),
+        _scenario(
+            name="Baseline",
+            starting_portfolio=100_000,
+            portfolio_allocation=_allocation(),
+        ).model_dump_json(),
         encoding="utf-8",
     )
     alternative_path.write_text(
-        _scenario(name="Alternative", starting_portfolio=80_000).model_dump_json(),
+        _scenario(
+            name="Alternative",
+            starting_portfolio=80_000,
+            portfolio_allocation=_allocation(),
+        ).model_dump_json(),
         encoding="utf-8",
     )
 
@@ -99,6 +303,8 @@ def test_cli_saves_and_compares_immutable_scenario_revisions(
             baseline["id"],
             "--alternative",
             alternative["id"],
+            "--named-stress",
+            "equity_crash",
             "--json",
         ],
     )
@@ -109,6 +315,7 @@ def test_cli_saves_and_compares_immutable_scenario_revisions(
     )
     assert comparison.baseline.revision_id == baseline["id"]
     assert comparison.alternatives[0].revision_id == alternative["id"]
+    assert comparison.manifest.common_paths.named_stress == "equity_crash"
 
     table_result = runner.invoke(
         app,

@@ -1184,9 +1184,10 @@ def test_optimizer_is_bounded_and_ranks_household_portfolio_outcomes() -> None:
     assert result.manifest["starting_portfolio"] == 500_000
     assert result.manifest["valuation_provenance"] == {
         "source": "test",
-        "as_of": None,
-        "account_ids": [],
-        "source_sha256": "test-snapshot",
+            "as_of": None,
+            "account_ids": [],
+            "account_values": [],
+            "source_sha256": "test-snapshot",
     }
     progressive_policy = result.manifest["progressive_tax_policy"]
     assert isinstance(progressive_policy, dict)

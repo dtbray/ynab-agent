@@ -10,15 +10,41 @@ import json
 import platform
 from typing import TYPE_CHECKING
 
-from ynab_agent.planning.historical import HistoricalSeries
+from ynab_agent.planning.allocation import (
+    ASSET_CLASS_COUNT,
+    AssetLocationStrategy,
+    PortfolioAllocationState,
+    estimate_allocation_state_bytes,
+    portfolio_allocation_manifest,
+)
+from ynab_agent.planning.historical import (
+    AssetHistoricalReturns,
+    HistoricalSeries,
+)
+from ynab_agent.planning.housing import (
+    HousingState,
+    estimate_housing_state_bytes,
+    housing_manifest,
+)
 from ynab_agent.planning.household import (
     HouseholdState,
     estimate_household_state_bytes,
     prepare_household_state,
+    validate_household_state,
+)
+from ynab_agent.planning.healthcare import (
+    HealthcareState,
+    IRMAA_LOOKBACK_POLICY,
+    estimate_healthcare_state_bytes,
+    healthcare_manifest,
+    prepare_healthcare_state,
+    validate_healthcare_state,
 )
 from ynab_agent.planning.models import (
     CashFlowType,
+    FederalFilingStatus,
     IncomeTaxTreatment,
+    ProgressiveTaxAssumptions,
     ReturnModel,
     TaxTreatment,
     ValuationProvenance,
@@ -37,6 +63,9 @@ from ynab_agent.planning.paths import (
     PreparedExperiment,
     RunPolicy,
     SimulationPaths,
+    MultiAssetSimulationPaths,
+    multi_asset_path_manifest,
+    multi_asset_return_paths,
     prepare_experiment,
 )
 from ynab_agent.planning.progressive_tax import (
@@ -58,14 +87,15 @@ from ynab_agent.planning.tax_engine import (
     household_tax_engine_for,
 )
 from ynab_agent.planning.social_security import social_security_policy_manifest
+from ynab_agent.planning.stress import NamedStressName
 
 if TYPE_CHECKING:
     import numpy as np
 
 
-SIMULATION_RESULT_SCHEMA_VERSION = 7
-REPRODUCIBILITY_MANIFEST_SCHEMA_VERSION = 6
-SIMULATION_ENGINE_VERSION = "wealth_simulation_v8"
+SIMULATION_RESULT_SCHEMA_VERSION = 11
+REPRODUCIBILITY_MANIFEST_SCHEMA_VERSION = 10
+SIMULATION_ENGINE_VERSION = "wealth_simulation_v12"
 _SCENARIO_CANONICALIZATION = "json_sort_keys_v1"
 
 
@@ -88,6 +118,8 @@ class SimulationResult:
     irmaa_exposure_probability: float | None
     annual_tax_audit: list[dict[str, object]]
     annual_tax_strategy_actions: list[dict[str, object]]
+    annual_housing: list[dict[str, object]]
+    housing_manifest: dict[str, object] | None
     annual_balance_real: list[dict[str, float | int]]
     funded_spending_ratio: dict[str, float]
     funded_spending_real: dict[str, float]
@@ -97,11 +129,16 @@ class SimulationResult:
     recovered_trials: int
     recovery_probability: float | None
     after_tax_ending_balance_real: dict[str, float] | None
+    estate_value_real: dict[str, float] | None
+    after_tax_estate_value_real: dict[str, float] | None
     legacy_target_probability: float | None
     goal_outcomes: tuple[GoalOutcome, ...]
     annual_spending_real: list[dict[str, object]]
     guardrail_metrics: dict[str, object] | None
     household_cash_flow_audit: list[dict[str, object]]
+    annual_allocation_real: list[dict[str, object]]
+    annual_healthcare_real: list[dict[str, object]]
+    healthcare_metrics: dict[str, object] | None
     assumptions: dict[str, bool | float | int | str]
     engine: dict[str, str | int]
     reproducibility: dict[str, object] = field(compare=False)
@@ -138,8 +175,19 @@ class _TrialOutcomes:
     cumulative_spending_restoration_real: np.ndarray | None = None
     annual_tax_audit: list[dict[str, object]] = field(default_factory=list)
     annual_tax_strategy_actions: list[dict[str, object]] = field(default_factory=list)
+    annual_housing: list[dict[str, object]] = field(default_factory=list)
+    estate_ending_balances: np.ndarray | None = None
+    after_tax_estate_balances: np.ndarray | None = None
     cumulative_irmaa_surcharge_real: np.ndarray | None = None
     irmaa_exposed: np.ndarray | None = None
+    cumulative_healthcare_shortfall_real: np.ndarray | None = None
+    cumulative_ltc_shortfall_real: np.ndarray | None = None
+    annual_ltc_home_equity_used: list[np.ndarray] = field(
+        default_factory=list
+    )
+    annual_irmaa_surcharge_real: list[dict[str, object]] = field(
+        default_factory=list
+    )
 
 
 @dataclass
@@ -155,6 +203,48 @@ class _GuardrailTrialState:
     restoration_events: np.ndarray
     cumulative_reduction_real: np.ndarray
     cumulative_restoration_real: np.ndarray
+
+
+def _housing_costs_for_slice(
+    scenario: WealthScenario,
+    year: object,
+    inflation_factor: float | np.ndarray,
+) -> tuple[float | np.ndarray, float | np.ndarray]:
+    """Return non-care housing spending and care on each inflation path."""
+    from ynab_agent.planning.housing import HousingYear
+
+    if not isinstance(year, HousingYear):  # pragma: no cover - invariant
+        raise TypeError("expected HousingYear")
+    plan = scenario.housing_plan
+    if plan is None:  # pragma: no cover - invariant
+        raise RuntimeError("housing plan is missing")
+    costs_start = (
+        plan.costs_start_age
+        if plan.costs_start_age is not None
+        else scenario.retirement_age
+    )
+    rent_real = (
+        plan.decision.annual_rent_real or 0.0
+        if year.age >= costs_start
+        else 0.0
+    )
+    care_real = (
+        plan.care.annual_cost_real
+        if plan.care is not None
+        and plan.care.annual_cost_real is not None
+        and plan.care.start_age is not None
+        and plan.care.end_age is not None
+        and plan.care.start_age <= year.age <= plan.care.end_age
+        else 0.0
+    )
+    fixed_noncare = max(
+        0.0,
+        year.portfolio_spending_excluding_care - year.rent,
+    )
+    return (
+        fixed_noncare + rent_real * inflation_factor,
+        care_real * inflation_factor,
+    )
 
 
 def _percentiles(values: np.ndarray) -> dict[str, float]:
@@ -212,8 +302,21 @@ def _tax_policy_manifest(scenario: WealthScenario) -> dict[str, object] | None:
         },
         "irmaa_hook": {
             "lookback_years": 2,
+            "selection_precedence": IRMAA_LOOKBACK_POLICY,
             "historical_magi": [
-                value.model_dump(mode="json")
+                {
+                    "tax_year": value.tax_year,
+                    "magi": value.magi,
+                    "filing_status": (
+                        value.filing_status
+                        or progressive.filing_status
+                    ).value,
+                    "filing_status_source": (
+                        "explicit"
+                        if value.filing_status is not None
+                        else "inferred_from_initial_filing_status"
+                    ),
+                }
                 for value in progressive.irmaa_lookback_magi
             ],
         },
@@ -233,19 +336,60 @@ def _tax_policy_manifest(scenario: WealthScenario) -> dict[str, object] | None:
     }
 
 
+def _resolve_irmaa_lookback(
+    progressive: ProgressiveTaxAssumptions,
+    simulated_magi_by_year: dict[int, tuple[np.ndarray, np.ndarray]],
+    *,
+    lookback_year: int,
+) -> tuple[
+    float | np.ndarray | None,
+    FederalFilingStatus | None,
+    np.ndarray | None,
+    str | None,
+]:
+    """Prefer reviewed exact history over a modeled value for the same year."""
+    supplied = next(
+        (
+            value
+            for value in progressive.irmaa_lookback_magi
+            if value.tax_year == lookback_year
+        ),
+        None,
+    )
+    if supplied is not None:
+        return (
+            supplied.magi,
+            supplied.filing_status or progressive.filing_status,
+            None,
+            "supplied_exact_history",
+        )
+    simulated = simulated_magi_by_year.get(lookback_year)
+    if simulated is not None:
+        magi, joint_filing = simulated
+        return magi, None, joint_filing, "simulated_magi"
+    return None, None, None, None
+
+
 def _canonical_observation_sha256(
     historical_returns: Sequence[float],
     historical_inflation: Sequence[float] | None,
+    historical_asset_returns: AssetHistoricalReturns | None = None,
 ) -> str:
+    payload: dict[str, object] = {
+        "inflation_rates": (
+            [float(value) for value in historical_inflation]
+            if historical_inflation is not None
+            else None
+        ),
+        "nominal_returns": [float(value) for value in historical_returns],
+    }
+    if historical_asset_returns is not None:
+        payload["asset_returns"] = [
+            [float(value) for value in series]
+            for series in historical_asset_returns
+        ]
     canonical = json.dumps(
-        {
-            "inflation_rates": (
-                [float(value) for value in historical_inflation]
-                if historical_inflation is not None
-                else None
-            ),
-            "nominal_returns": [float(value) for value in historical_returns],
-        },
+        payload,
         allow_nan=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -299,6 +443,7 @@ def _historical_manifest(
     *,
     historical_returns: Sequence[float] | None,
     historical_inflation: Sequence[float] | None,
+    historical_asset_returns: AssetHistoricalReturns | None,
     historical_series: HistoricalSeries | None,
     historical_source: str | None,
     historical_fingerprint: str | None,
@@ -322,6 +467,7 @@ def _historical_manifest(
             _canonical_observation_sha256(
                 historical_returns,
                 historical_inflation,
+                historical_asset_returns,
             )
             if historical_returns is not None
             else (paths.historical_values_sha256 if isinstance(paths, PreparedExperiment) else None)
@@ -331,6 +477,7 @@ def _historical_manifest(
         _canonical_observation_sha256(
             historical_returns,
             historical_inflation,
+            historical_asset_returns,
         )
         if historical_returns is not None
         else (paths.historical_values_sha256 if isinstance(paths, PreparedExperiment) else None)
@@ -356,6 +503,7 @@ def _historical_manifest(
             historical_series.gap_policy.value if historical_series is not None else None
         ),
         "paired_inflation": paired_inflation,
+        "multi_asset_returns": historical_asset_returns is not None,
     }
     bootstrap: dict[str, object] = {
         "method": "stationary_bootstrap",
@@ -371,6 +519,8 @@ def prepare_simulation_paths(
     *,
     historical_returns: Sequence[float] | None = None,
     historical_inflation: Sequence[float] | None = None,
+    historical_asset_returns: AssetHistoricalReturns | None = None,
+    named_stress: NamedStressName | None = None,
     path_source: PathSource | BoundedPathSource | None = None,
     run_policy: RunPolicy | None = None,
 ) -> PreparedExperiment:
@@ -386,6 +536,8 @@ def prepare_simulation_paths(
         scenario,
         historical_returns=historical_returns,
         historical_inflation=historical_inflation,
+        historical_asset_returns=historical_asset_returns,
+        named_stress=named_stress,
         path_source=path_source,
         run_policy=run_policy,
     )
@@ -456,6 +608,85 @@ def _record_guardrail_decision(
     )
 
 
+AllocationObserver = Callable[
+    [
+        int,
+        PortfolioAllocationState,
+        "np.ndarray",
+        "np.ndarray",
+        "np.ndarray",
+    ],
+    None,
+]
+
+
+def _new_allocation_state(
+    scenario: WealthScenario,
+    paths: SimulationPaths,
+    *,
+    strategy: AssetLocationStrategy | None,
+) -> tuple[PortfolioAllocationState | None, np.ndarray | None]:
+    plan = scenario.portfolio_allocation
+    asset_paths = multi_asset_return_paths(paths)
+    if plan is None:
+        if asset_paths is not None:
+            raise ValueError(
+                "multi-asset paths require portfolio_allocation assumptions"
+            )
+        return None, None
+    if asset_paths is None:
+        raise ValueError(
+            "portfolio_allocation requires aligned multi-asset return paths"
+        )
+    expected_shape = (
+        ASSET_CLASS_COUNT,
+        scenario.end_age - scenario.current_age,
+        scenario.trials,
+    )
+    if asset_paths.shape != expected_shape:
+        raise ValueError(
+            "multi-asset return paths do not match the scenario"
+        )
+    account_tax_treatments = {
+        bucket.account_id: bucket.tax_treatment.value
+        for bucket in scenario.tax_buckets
+        if bucket.account_id is not None
+    }
+    tax_strategy = (
+        scenario.tax_assumptions.strategy
+        if scenario.tax_assumptions is not None
+        else None
+    )
+    asset_location_preferences = (
+        tuple(
+            (
+                preference.asset_class,
+                tuple(
+                    treatment.value
+                    for treatment in (
+                        preference.preferred_tax_treatments
+                    )
+                ),
+            )
+            for preference in tax_strategy.asset_location_preferences
+        )
+        if tax_strategy is not None
+        else ()
+    )
+    return (
+        PortfolioAllocationState(
+            plan,
+            trials=scenario.trials,
+            current_age=scenario.current_age,
+            global_annual_fee_rate=scenario.annual_fee_rate,
+            strategy=strategy,
+            account_tax_treatments=account_tax_treatments,
+            asset_location_preferences=asset_location_preferences,
+        ),
+        asset_paths,
+    )
+
+
 def _run_blended_trial_outcomes(
     scenario: WealthScenario,
     starting_portfolio: float,
@@ -463,6 +694,8 @@ def _run_blended_trial_outcomes(
     paths: SimulationPaths,
     annual_observer: Callable[[int, np.ndarray], None] | None = None,
     outcome_accumulator: OutcomeAccumulator | None = None,
+    allocation_observer: AllocationObserver | None = None,
+    allocation_strategy: AssetLocationStrategy | None = None,
     spending_observer: (
         Callable[
             [
@@ -476,6 +709,7 @@ def _run_blended_trial_outcomes(
         | None
     ) = None,
     household_state: HouseholdState | None = None,
+    healthcare_state: HealthcareState | None = None,
 ) -> _TrialOutcomes:
     """Evolve trial balances without computing report statistics."""
     try:
@@ -505,6 +739,7 @@ def _run_blended_trial_outcomes(
         expected_spec = PathSpec.from_scenario(
             scenario,
             paired_historical_inflation=paths.spec.paired_historical_inflation,
+            named_stress=paths.spec.named_stress,
         )
         if paths.spec != expected_spec:
             raise ValueError("prepared experiment does not match the scenario path assumptions")
@@ -512,10 +747,21 @@ def _run_blended_trial_outcomes(
     balances = np.full(scenario.trials, starting_portfolio, dtype=float)
     retirement_balances = balances.copy() if retirement_offset == 0 else None
     depletion_ages = np.full(scenario.trials, np.nan)
+    cumulative_healthcare_shortfall_real = (
+        np.zeros(scenario.trials) if healthcare_state is not None else None
+    )
+    cumulative_ltc_shortfall_real = (
+        np.zeros(scenario.trials) if healthcare_state is not None else None
+    )
     spending_plan = scenario.retirement_spending_plan
     guardrail_state = _new_guardrail_state(
         spending_plan,
         scenario.trials,
+    )
+    allocation_state, asset_paths = _new_allocation_state(
+        scenario,
+        paths,
+        strategy=allocation_strategy,
     )
     if annual_observer is not None:
         annual_observer(scenario.current_age, balances)
@@ -539,14 +785,66 @@ def _run_blended_trial_outcomes(
             if annual_action is not None
             else None
         )
+        annual_fee_real = (
+            np.zeros(scenario.trials, dtype=float)
+            if allocation_state is not None
+            else None
+        )
+        annual_turnover_real = (
+            np.zeros(scenario.trials, dtype=float)
+            if allocation_state is not None
+            else None
+        )
+        annual_rebalanced = (
+            np.zeros(scenario.trials, dtype=bool)
+            if allocation_state is not None
+            else None
+        )
         for trial_slice in batches:
             batch_balances = balances[trial_slice]
-            batch_balances *= paths.gross_returns[offset, trial_slice]
             inflation_factor = (
                 paths.inflation_factors[offset]
                 if paths.inflation_factors.ndim == 1
                 else paths.inflation_factors[offset, trial_slice]
             )
+            if allocation_state is not None and asset_paths is not None:
+                allocation_decision = allocation_state.apply_year(
+                    trial_slice,
+                    asset_gross_returns=asset_paths[
+                        :,
+                        offset,
+                        trial_slice,
+                    ],
+                    opening_portfolio_nominal=batch_balances,
+                    inflation_factor=inflation_factor,
+                    age=age,
+                    year_index=offset,
+                )
+                batch_balances *= (
+                    allocation_decision.portfolio_gross_return
+                )
+                if (
+                    annual_fee_real is None
+                    or annual_turnover_real is None
+                    or annual_rebalanced is None
+                ):  # pragma: no cover - allocation initialization invariant
+                    raise RuntimeError(
+                        "allocation annual audit was not initialized"
+                    )
+                annual_fee_real[trial_slice] = (
+                    allocation_decision.fee_real
+                )
+                annual_turnover_real[trial_slice] = (
+                    allocation_decision.turnover_real
+                )
+                annual_rebalanced[trial_slice] = (
+                    allocation_decision.rebalanced
+                )
+            else:
+                batch_balances *= paths.gross_returns[
+                    offset,
+                    trial_slice,
+                ]
 
             if age < scenario.retirement_age:
                 contribution: float | np.ndarray = scenario.annual_contribution
@@ -623,6 +921,16 @@ def _run_blended_trial_outcomes(
                     if cash_flow.inflation_adjusted:
                         expense_amount = expense_amount * inflation_factor
                     spending = spending + expense_amount
+                healthcare_cost: float | np.ndarray = 0.0
+                ltc_cost: float | np.ndarray = 0.0
+                if healthcare_state is not None:
+                    healthcare_cost = healthcare_state.total_cost[
+                        offset, trial_slice
+                    ]
+                    ltc_cost = healthcare_state.ltc_net_cost[
+                        offset, trial_slice
+                    ]
+                    spending = spending + healthcare_cost
                 income: float | np.ndarray = 0.0
                 if household_state is not None:
                     income = (
@@ -651,6 +959,21 @@ def _run_blended_trial_outcomes(
                     shortfall = np.maximum(0.0, withdrawal - batch_balances) * (
                         1 - scenario.withdrawal_tax_rate
                     )
+                    if (
+                        cumulative_healthcare_shortfall_real is not None
+                        and cumulative_ltc_shortfall_real is not None
+                    ):
+                        healthcare_shortfall = np.minimum(
+                            shortfall,
+                            healthcare_cost,
+                        )
+                        cumulative_healthcare_shortfall_real[trial_slice] += (
+                            healthcare_shortfall / inflation_factor
+                        )
+                        cumulative_ltc_shortfall_real[trial_slice] += (
+                            np.minimum(healthcare_shortfall, ltc_cost)
+                            / inflation_factor
+                        )
                     outcome_accumulator.record_retirement_year(
                         trial_slice,
                         required_real=spending / inflation_factor,
@@ -679,6 +1002,20 @@ def _run_blended_trial_outcomes(
 
         if offset + 1 == retirement_offset:
             retirement_balances = balances.copy()
+        if (
+            allocation_observer is not None
+            and allocation_state is not None
+            and annual_fee_real is not None
+            and annual_turnover_real is not None
+            and annual_rebalanced is not None
+        ):
+            allocation_observer(
+                age,
+                allocation_state,
+                annual_fee_real,
+                annual_turnover_real,
+                annual_rebalanced,
+            )
         if (
             spending_observer is not None
             and guardrail_state is not None
@@ -724,6 +1061,10 @@ def _run_blended_trial_outcomes(
             if guardrail_state is not None
             else None
         ),
+        cumulative_healthcare_shortfall_real=(
+            cumulative_healthcare_shortfall_real
+        ),
+        cumulative_ltc_shortfall_real=cumulative_ltc_shortfall_real,
     )
 
 
@@ -734,6 +1075,8 @@ def _run_tax_aware_trial_outcomes(
     paths: SimulationPaths,
     annual_observer: Callable[[int, np.ndarray], None] | None = None,
     outcome_accumulator: OutcomeAccumulator | None = None,
+    allocation_observer: AllocationObserver | None = None,
+    allocation_strategy: AssetLocationStrategy | None = None,
     spending_observer: (
         Callable[
             [
@@ -747,6 +1090,7 @@ def _run_tax_aware_trial_outcomes(
         | None
     ) = None,
     household_state: HouseholdState | None = None,
+    healthcare_state: HealthcareState | None = None,
     tax_engine: HouseholdTaxEngine | None = None,
 ) -> _TrialOutcomes:
     """Evolve explicit tax buckets with account-aware retirement withdrawals."""
@@ -776,6 +1120,7 @@ def _run_tax_aware_trial_outcomes(
         expected_spec = PathSpec.from_scenario(
             scenario,
             paired_historical_inflation=paths.spec.paired_historical_inflation,
+            named_stress=paths.spec.named_stress,
         )
         if paths.spec != expected_spec:
             raise ValueError("prepared experiment does not match the scenario path assumptions")
@@ -787,10 +1132,26 @@ def _run_tax_aware_trial_outcomes(
     initial_balances = portfolio.total(slice(0, scenario.trials))
     retirement_balances = initial_balances.copy() if retirement_offset == 0 else None
     depletion_ages = np.full(scenario.trials, np.nan)
+    cumulative_healthcare_shortfall_real = (
+        np.zeros(scenario.trials) if healthcare_state is not None else None
+    )
+    cumulative_ltc_shortfall_real = (
+        np.zeros(scenario.trials) if healthcare_state is not None else None
+    )
     spending_plan = scenario.retirement_spending_plan
     guardrail_state = _new_guardrail_state(
         spending_plan,
         scenario.trials,
+    )
+    allocation_state, asset_paths = _new_allocation_state(
+        scenario,
+        paths,
+        strategy=allocation_strategy,
+    )
+    housing_state = (
+        HousingState.from_plan(scenario.housing_plan)
+        if scenario.housing_plan is not None
+        else None
     )
     if annual_observer is not None:
         annual_observer(scenario.current_age, initial_balances)
@@ -803,10 +1164,168 @@ def _run_tax_aware_trial_outcomes(
     batches = tuple(trial_slices)
     annual_tax_audit: list[dict[str, object]] = []
     annual_tax_strategy_actions: list[dict[str, object]] = []
-    simulated_magi_by_year: dict[int, np.ndarray] = {}
+    annual_irmaa_surcharge_real: list[dict[str, object]] = []
+    simulated_magi_by_year: dict[
+        int,
+        tuple[np.ndarray, np.ndarray],
+    ] = {}
+    annual_housing: list[dict[str, object]] = []
+    annual_ltc_home_equity_used: list[np.ndarray] = []
+    remaining_ltc_home_equity_real = (
+        np.full(
+            scenario.trials,
+            scenario.healthcare.home_equity_available_for_ltc_real,
+            dtype=float,
+        )
+        if scenario.healthcare is not None
+        and scenario.healthcare.ltc_funding_source == "home_equity"
+        else None
+    )
     for offset in range(years):
         age = scenario.current_age + offset
+        tax_year = (
+            scenario.tax_assumptions.progressive.simulation_start_year
+            + offset
+            if scenario.tax_assumptions.progressive is not None
+            else 2026 + offset
+        )
+        housing_year = (
+            housing_state.advance(
+                age=age,
+                tax_year=tax_year,
+                inflation_factor=paths.inflation_factors[offset],
+                tax_assumptions=scenario.tax_assumptions,
+                default_costs_start_age=scenario.retirement_age,
+            )
+            if housing_state is not None
+            else None
+        )
         portfolio.reset_annual_audit()
+        annual_irmaa_surcharge = np.zeros(scenario.trials)
+        if (
+            age >= scenario.retirement_age
+            and scenario.tax_assumptions.progressive is not None
+        ):
+            progressive = scenario.tax_assumptions.progressive
+            tax_year = progressive.simulation_start_year + offset
+            lookback_year = tax_year - 2
+            (
+                lookback_magi,
+                lookback_filing_status,
+                lookback_joint_filing,
+                lookback_source,
+            ) = _resolve_irmaa_lookback(
+                progressive,
+                simulated_magi_by_year,
+                lookback_year=lookback_year,
+            )
+            eligible_people: int | np.ndarray | None = None
+            if household_state is not None:
+                eligible_people = np.zeros(
+                    scenario.trials,
+                    dtype=int,
+                )
+                for person_index in range(
+                    len(household_state.person_ids)
+                ):
+                    person_id = household_state.person_ids[
+                        person_index
+                    ]
+                    medicare_start_age = next(
+                        (
+                            person.medicare_start_age
+                            for person in (
+                                scenario.healthcare.people
+                                if scenario.healthcare is not None
+                                else ()
+                            )
+                            if person.person_id == person_id
+                        ),
+                        65,
+                    )
+                    if (
+                        household_state.person_age_months[
+                            person_index, offset
+                        ]
+                        >= medicare_start_age * 12
+                    ):
+                        eligible_people += household_state.person_alive[
+                            person_index, offset
+                        ]
+            if (
+                scenario.healthcare is not None
+                and lookback_magi is None
+                and eligible_people is not None
+                and np.any(np.asarray(eligible_people) > 0)
+            ):
+                raise ValueError(
+                    f"missing exact IRMAA tax-year-minus-two MAGI for {lookback_year}"
+                )
+            annual_irmaa_surcharge = np.broadcast_to(
+                calculate_irmaa_surcharge_arrays(
+                    progressive,
+                    tax_year=tax_year,
+                    lookback_magi=lookback_magi,
+                    eligible_people=eligible_people,
+                    lookback_filing_status=(
+                        lookback_filing_status
+                    ),
+                    lookback_joint_filing=lookback_joint_filing,
+                ),
+                (scenario.trials,),
+            ).astype(float, copy=True)
+            portfolio.annual_irmaa_surcharge_nominal[:] = (
+                annual_irmaa_surcharge
+            )
+            portfolio.cumulative_irmaa_surcharge_real += (
+                annual_irmaa_surcharge
+                / paths.inflation_factors[offset]
+            )
+            portfolio.irmaa_exposed |= annual_irmaa_surcharge > 0
+            annual_irmaa_surcharge_real.append(
+                {
+                    "age": age,
+                    "lookback_tax_year": lookback_year,
+                    "lookback_source": lookback_source,
+                    "lookback_precedence": IRMAA_LOOKBACK_POLICY,
+                    "lookback_filing_status": (
+                        lookback_filing_status.value
+                        if lookback_filing_status is not None
+                        else (
+                            "trial_specific_joint_or_single"
+                            if lookback_joint_filing is not None
+                            else None
+                        )
+                    ),
+                    "surcharge": _percentiles(
+                        annual_irmaa_surcharge
+                        / paths.inflation_factors[offset]
+                    ),
+                }
+            )
+        housing_destination_balance_before = np.zeros(
+            scenario.trials,
+            dtype=float,
+        )
+        housing_destination_balance_after = np.zeros(
+            scenario.trials,
+            dtype=float,
+        )
+        housing_destination_basis_before = np.zeros(
+            scenario.trials,
+            dtype=float,
+        )
+        housing_destination_basis_after = np.zeros(
+            scenario.trials,
+            dtype=float,
+        )
+        housing_care_funded = np.zeros(scenario.trials, dtype=float)
+        housing_care_fallback = np.zeros(scenario.trials, dtype=float)
+        housing_care_realized_gain = np.zeros(
+            scenario.trials,
+            dtype=float,
+        )
+        housing_destination_key = None
         annual_action = (
             np.zeros(scenario.trials, dtype=np.int8)
             if age >= scenario.retirement_age
@@ -818,16 +1337,211 @@ def _run_tax_aware_trial_outcomes(
             if annual_action is not None
             else None
         )
+        annual_fee_real = (
+            np.zeros(scenario.trials, dtype=float)
+            if allocation_state is not None
+            else None
+        )
+        annual_turnover_real = (
+            np.zeros(scenario.trials, dtype=float)
+            if allocation_state is not None
+            else None
+        )
+        annual_rebalanced = (
+            np.zeros(scenario.trials, dtype=bool)
+            if allocation_state is not None
+            else None
+        )
         for trial_slice in batches:
             inflation_factor = (
                 paths.inflation_factors[offset]
                 if paths.inflation_factors.ndim == 1
                 else paths.inflation_factors[offset, trial_slice]
             )
+            housing_noncare_spending: float | np.ndarray = 0.0
+            housing_care_requested: float | np.ndarray = 0.0
+            if housing_year is not None:
+                (
+                    housing_noncare_spending,
+                    housing_care_requested,
+                ) = _housing_costs_for_slice(
+                    scenario,
+                    housing_year,
+                    inflation_factor,
+                )
+                configured_plan = scenario.housing_plan
+                if configured_plan is None:  # pragma: no cover - invariant
+                    raise RuntimeError("housing plan is missing")
+                configured_care = configured_plan.care
+                if (
+                    configured_care is not None
+                    and configured_care.funding_account_id is None
+                ):
+                    housing_care_fallback[trial_slice] = (
+                        housing_care_requested
+                    )
+            healthcare_home_equity_care = (
+                healthcare_state is not None
+                and scenario.healthcare is not None
+                and scenario.healthcare.ltc_funding_source == "home_equity"
+            )
+            if (
+                healthcare_home_equity_care
+                and healthcare_state is not None
+            ):
+                housing_care_requested = healthcare_state.ltc_net_cost[
+                    offset, trial_slice
+                ]
+            care = (
+                scenario.housing_plan.care
+                if scenario.housing_plan is not None
+                else None
+            )
+            audit_account_id = (
+                housing_year.proceeds_destination_account_id
+                if housing_year is not None
+                and housing_year.proceeds_destination_account_id is not None
+                else (
+                    care.funding_account_id
+                    if np.any(np.asarray(housing_care_requested) > 0)
+                    and care is not None
+                    else None
+                )
+            )
+            if audit_account_id is not None:
+                (
+                    housing_destination_key,
+                    destination_balance_before,
+                    destination_basis_before,
+                ) = portfolio.account_balance_and_basis(
+                    trial_slice,
+                    account_id=audit_account_id,
+                )
+                housing_destination_balance_before[trial_slice] = (
+                    destination_balance_before
+                )
+                if destination_basis_before is not None:
+                    housing_destination_basis_before[trial_slice] = (
+                        destination_basis_before
+                    )
+                if (
+                    housing_year is not None
+                    and housing_year.liquid_deposit > 0
+                ):
+                    portfolio.deposit_external_cash_to_account(
+                        trial_slice,
+                        account_id=audit_account_id,
+                        amount=housing_year.liquid_deposit,
+                    )
+                if (
+                    housing_year is not None
+                    and care is not None
+                    and care.funding_account_id is not None
+                    and np.any(
+                        np.asarray(housing_care_requested) > 0
+                    )
+                ):
+                    funding_request = housing_care_requested
+                    if healthcare_home_equity_care:
+                        if remaining_ltc_home_equity_real is None:
+                            raise RuntimeError(
+                                "home-equity LTC reserve state was not initialized"
+                            )
+                        funding_request = np.minimum(
+                            np.asarray(housing_care_requested, dtype=float),
+                            remaining_ltc_home_equity_real[trial_slice]
+                            * inflation_factor,
+                        )
+                    funding = portfolio.fund_home_equity_care(
+                        trial_slice,
+                        account_id=care.funding_account_id,
+                        requested=funding_request,
+                    )
+                    housing_care_funded[trial_slice] = funding.funded
+                    housing_care_fallback[trial_slice] = (
+                        np.asarray(housing_care_requested, dtype=float)
+                        - funding.funded
+                    )
+                    housing_care_realized_gain[trial_slice] = (
+                        funding.realized_long_term_capital_gains
+                    )
+                    if (
+                        healthcare_home_equity_care
+                        and remaining_ltc_home_equity_real is not None
+                    ):
+                        remaining_ltc_home_equity_real[trial_slice] -= (
+                            funding.funded / inflation_factor
+                        )
+                (
+                    _,
+                    destination_balance_after,
+                    destination_basis_after,
+                ) = portfolio.account_balance_and_basis(
+                    trial_slice,
+                    account_id=audit_account_id,
+                )
+                housing_destination_balance_after[trial_slice] = (
+                    destination_balance_after
+                )
+                if destination_basis_after is not None:
+                    housing_destination_basis_after[trial_slice] = (
+                        destination_basis_after
+                    )
             opening_tax_deferred = portfolio.opening_tax_deferred(trial_slice)
+            account_gross_returns: dict[str, np.ndarray] | None = None
+            if allocation_state is not None and asset_paths is not None:
+                linked_balances = portfolio.account_balances(trial_slice)
+                if linked_balances:
+                    allocation_state.align_account_balances(
+                        trial_slice,
+                        linked_balances,
+                        age=age,
+                    )
+                del linked_balances
+                allocation_decision = allocation_state.apply_year(
+                    trial_slice,
+                    asset_gross_returns=asset_paths[
+                        :,
+                        offset,
+                        trial_slice,
+                    ],
+                    opening_portfolio_nominal=portfolio.total(
+                        trial_slice
+                    ),
+                    inflation_factor=inflation_factor,
+                    age=age,
+                    year_index=offset,
+                )
+                gross_return = allocation_decision.portfolio_gross_return
+                account_gross_returns = (
+                    allocation_decision.account_gross_returns
+                )
+                if (
+                    annual_fee_real is None
+                    or annual_turnover_real is None
+                    or annual_rebalanced is None
+                ):  # pragma: no cover - allocation initialization invariant
+                    raise RuntimeError(
+                        "allocation annual audit was not initialized"
+                    )
+                annual_fee_real[trial_slice] = (
+                    allocation_decision.fee_real
+                )
+                annual_turnover_real[trial_slice] = (
+                    allocation_decision.turnover_real
+                )
+                annual_rebalanced[trial_slice] = (
+                    allocation_decision.rebalanced
+                )
+            else:
+                gross_return = paths.gross_returns[
+                    offset,
+                    trial_slice,
+                ]
             portfolio.apply_growth(
                 trial_slice,
-                paths.gross_returns[offset, trial_slice],
+                gross_return,
+                account_gross_returns=account_gross_returns,
                 inflation_factor=inflation_factor,
                 assumptions=scenario.tax_assumptions,
             )
@@ -901,6 +1615,24 @@ def _run_tax_aware_trial_outcomes(
                     spending = (
                         scenario.annual_spending * inflation_factor
                     )
+                if housing_year is not None:
+                    spending = (
+                        spending
+                        + housing_noncare_spending
+                    )
+                    spending_housing_plan = scenario.housing_plan
+                    if spending_housing_plan is None:  # pragma: no cover
+                        raise RuntimeError("housing plan is missing")
+                    care_plan = spending_housing_plan.care
+                    if (
+                        care_plan is not None
+                        and care_plan.annual_cost_real is not None
+                    ):
+                        spending = spending + (
+                            housing_care_fallback[trial_slice]
+                            if care_plan.funding_account_id is not None
+                            else housing_care_requested
+                        )
                 if household_state is not None:
                     spending = (
                         spending
@@ -917,6 +1649,30 @@ def _run_tax_aware_trial_outcomes(
                     if cash_flow.inflation_adjusted:
                         expense_amount = expense_amount * inflation_factor
                     spending = spending + expense_amount
+                healthcare_cost: float | np.ndarray = (
+                    annual_irmaa_surcharge[trial_slice]
+                )
+                ltc_cost: float | np.ndarray = 0.0
+                if healthcare_state is not None:
+                    healthcare_cost = (
+                        healthcare_cost
+                        + healthcare_state.total_cost[
+                            offset, trial_slice
+                        ]
+                    )
+                    ltc_cost = healthcare_state.ltc_net_cost[
+                        offset, trial_slice
+                    ]
+                    if healthcare_home_equity_care:
+                        healthcare_cost = (
+                            healthcare_cost
+                            - housing_care_funded[trial_slice]
+                        )
+                        ltc_cost = (
+                            ltc_cost
+                            - housing_care_funded[trial_slice]
+                        )
+                spending = spending + healthcare_cost
 
                 ordinary_income: float | np.ndarray = 0.0
                 social_security_income: float | np.ndarray = 0.0
@@ -953,11 +1709,7 @@ def _run_tax_aware_trial_outcomes(
                 unmet = portfolio.fund_retirement_spending(
                     trial_slice,
                     age=age,
-                    tax_year=(
-                        scenario.tax_assumptions.progressive.simulation_start_year + offset
-                        if scenario.tax_assumptions.progressive is not None
-                        else 2026 + offset
-                    ),
+                    tax_year=tax_year,
                     spending=spending,
                     ordinary_income=ordinary_income,
                     social_security_income=social_security_income,
@@ -965,6 +1717,14 @@ def _run_tax_aware_trial_outcomes(
                     opening_tax_deferred=opening_tax_deferred,
                     inflation_factor=inflation_factor,
                     assumptions=scenario.tax_assumptions,
+                    external_long_term_capital_gains=(
+                        (
+                            housing_year.taxable_gain
+                            if housing_year is not None
+                            else 0.0
+                        )
+                        + housing_care_realized_gain[trial_slice]
+                    ),
                     joint_filing=(
                         household_state.joint_filing[offset, trial_slice]
                         if household_state is not None
@@ -985,9 +1745,30 @@ def _run_tax_aware_trial_outcomes(
                 newly_depleted = np.isnan(batch_depletion_ages) & failed
                 batch_depletion_ages[newly_depleted] = age
                 if outcome_accumulator is not None:
+                    if (
+                        cumulative_healthcare_shortfall_real is not None
+                        and cumulative_ltc_shortfall_real is not None
+                    ):
+                        healthcare_shortfall = np.minimum(
+                            unmet,
+                            healthcare_cost,
+                        )
+                        cumulative_healthcare_shortfall_real[
+                            trial_slice
+                        ] += healthcare_shortfall / inflation_factor
+                        cumulative_ltc_shortfall_real[
+                            trial_slice
+                        ] += (
+                            np.minimum(healthcare_shortfall, ltc_cost)
+                            / inflation_factor
+                        )
                     outcome_accumulator.record_retirement_year(
                         trial_slice,
-                        required_real=spending / inflation_factor,
+                        required_real=(
+                            spending
+                            + housing_care_funded[trial_slice]
+                        )
+                        / inflation_factor,
                         shortfall_real=unmet / inflation_factor,
                         failed=failed,
                         active=(
@@ -1006,10 +1787,95 @@ def _run_tax_aware_trial_outcomes(
                         ),
                     )
 
+        if housing_year is not None:
+            housing_audit = housing_year.as_dict()
+            annual_inflation = paths.inflation_factors[offset]
+            annual_noncare, annual_care = _housing_costs_for_slice(
+                scenario,
+                housing_year,
+                annual_inflation,
+            )
+            plan = scenario.housing_plan
+            if plan is None:  # pragma: no cover - invariant
+                raise RuntimeError("housing plan is missing")
+            costs_start = (
+                plan.costs_start_age
+                if plan.costs_start_age is not None
+                else scenario.retirement_age
+            )
+            annual_rent = (
+                (plan.decision.annual_rent_real or 0.0)
+                * annual_inflation
+                if age >= costs_start
+                else np.asarray(annual_inflation) * 0.0
+            )
+            housing_audit.update(
+                {
+                    "rent_nominal": _percentiles(
+                        np.broadcast_to(
+                            np.asarray(annual_rent, dtype=float),
+                            (scenario.trials,),
+                        )
+                    ),
+                    "care_nominal": _percentiles(
+                        np.broadcast_to(
+                            np.asarray(annual_care, dtype=float),
+                            (scenario.trials,),
+                        )
+                    ),
+                    "portfolio_spending_nominal": _percentiles(
+                        np.broadcast_to(
+                            np.asarray(
+                                annual_noncare + annual_care,
+                                dtype=float,
+                            ),
+                            (scenario.trials,),
+                        )
+                    ),
+                    "destination_tax_treatment": (
+                        housing_destination_key.tax_treatment.value
+                        if housing_destination_key is not None
+                        else None
+                    ),
+                    "destination_owner_person_id": (
+                        housing_destination_key.owner_person_id
+                        if housing_destination_key is not None
+                        else None
+                    ),
+                    "destination_balance_before_nominal": _percentiles(
+                        housing_destination_balance_before
+                    ),
+                    "destination_balance_after_nominal": _percentiles(
+                        housing_destination_balance_after
+                    ),
+                    "destination_basis_before_nominal": _percentiles(
+                        housing_destination_basis_before
+                    ),
+                    "destination_basis_after_nominal": _percentiles(
+                        housing_destination_basis_after
+                    ),
+                    "care_funded_from_home_equity_nominal": _percentiles(
+                        housing_care_funded
+                    ),
+                    "care_portfolio_fallback_nominal": _percentiles(
+                        housing_care_fallback
+                    ),
+                    "care_realized_long_term_capital_gains_nominal": (
+                        _percentiles(housing_care_realized_gain)
+                    ),
+                }
+            )
+            annual_housing.append(housing_audit)
+        if remaining_ltc_home_equity_real is not None:
+            annual_ltc_home_equity_used.append(
+                housing_care_funded.copy()
+            )
+
         owner_flows = (
             [
                 {
                     "owner_person_id": key.owner_person_id,
+                    "account_id": key.account_id,
                     "tax_treatment": key.tax_treatment.value,
                     "required_minimum_distribution_nominal": (
                         _percentiles(portfolio.annual_rmd_nominal[key])
@@ -1029,40 +1895,27 @@ def _run_tax_aware_trial_outcomes(
         ):
             progressive = scenario.tax_assumptions.progressive
             tax_year = progressive.simulation_start_year + offset
-            lookback_year = tax_year - 2
-            lookback_magi: float | np.ndarray | None = simulated_magi_by_year.get(
-                lookback_year
-            )
-            if lookback_magi is None:
-                lookback_magi = next(
-                    (
-                        value.magi
-                        for value in progressive.irmaa_lookback_magi
-                        if value.tax_year == lookback_year
-                    ),
-                    None,
-                )
-            surcharge = np.broadcast_to(
-                calculate_irmaa_surcharge_arrays(
-                    progressive,
-                    tax_year=tax_year,
-                    lookback_magi=lookback_magi,
-                ),
-                (scenario.trials,),
-            ).astype(float, copy=True)
-            portfolio.annual_irmaa_surcharge_nominal[:] = surcharge
-            portfolio.cumulative_irmaa_surcharge_real += (
-                surcharge / paths.inflation_factors[offset]
-            )
-            portfolio.irmaa_exposed |= surcharge > 0
             simulated_magi_by_year[tax_year] = (
-                portfolio.annual_modified_adjusted_gross_income_nominal.copy()
+                portfolio.annual_modified_adjusted_gross_income_nominal.copy(),
+                (
+                    household_state.joint_filing[offset].copy()
+                    if household_state is not None
+                    else np.full(
+                        scenario.trials,
+                        progressive.filing_status
+                        is FederalFilingStatus.MARRIED_FILING_JOINTLY,
+                        dtype=bool,
+                    )
+                ),
             )
             annual_tax_audit.append(
                 {
                     "tax_year": tax_year,
                     "age": age,
                     "owner_flows": owner_flows,
+                    "irmaa_lookback_tax_year": lookback_year,
+                    "irmaa_lookback_source": lookback_source,
+                    "irmaa_lookback_precedence": IRMAA_LOOKBACK_POLICY,
                     "total_income_tax_nominal": _percentiles(portfolio.annual_tax_nominal),
                     "federal_income_tax_nominal": _percentiles(
                         portfolio.annual_federal_tax_nominal
@@ -1148,6 +2001,20 @@ def _run_tax_aware_trial_outcomes(
         if offset + 1 == retirement_offset:
             retirement_balances = total_balances.copy()
         if (
+            allocation_observer is not None
+            and allocation_state is not None
+            and annual_fee_real is not None
+            and annual_turnover_real is not None
+            and annual_rebalanced is not None
+        ):
+            allocation_observer(
+                age,
+                allocation_state,
+                annual_fee_real,
+                annual_turnover_real,
+                annual_rebalanced,
+            )
+        if (
             spending_observer is not None
             and guardrail_state is not None
             and annual_action is not None
@@ -1167,19 +2034,48 @@ def _run_tax_aware_trial_outcomes(
 
     if retirement_balances is None:
         raise RuntimeError("retirement balance was not captured")
+    terminal_joint_filing = (
+        household_state.joint_filing[-1]
+        if household_state is not None
+        else None
+    )
+    terminal_tax_year = (
+        scenario.tax_assumptions.progressive.simulation_start_year + years
+        if scenario.tax_assumptions.progressive is not None
+        else 2026 + years
+    )
     after_tax_ending_balances = portfolio.after_tax_estate_value(
         slice(0, scenario.trials),
         assumptions=scenario.tax_assumptions,
-        tax_year=(
-            scenario.tax_assumptions.progressive.simulation_start_year + years
-            if scenario.tax_assumptions.progressive is not None
-            else 2026 + years
-        ),
-        joint_filing=(
-            household_state.joint_filing[-1]
-            if household_state is not None
-            else None
-        ),
+        tax_year=terminal_tax_year,
+        joint_filing=terminal_joint_filing,
+    )
+    housing_disposition = (
+        housing_state.disposition_value()
+        if housing_state is not None
+        else None
+    )
+    estate_ending_balances = (
+        portfolio.total(slice(0, scenario.trials))
+        + housing_disposition.pre_tax_value
+        if housing_disposition is not None
+        else None
+    )
+    after_tax_estate_balances = (
+        portfolio.after_tax_estate_value(
+            slice(0, scenario.trials),
+            assumptions=scenario.tax_assumptions,
+            tax_year=terminal_tax_year,
+            joint_filing=terminal_joint_filing,
+            external_disposition_value=(
+                housing_disposition.pre_tax_value
+            ),
+            external_long_term_capital_gains=(
+                housing_disposition.taxable_gain
+            ),
+        )
+        if housing_disposition is not None
+        else None
     )
     return _TrialOutcomes(
         ending_balances=portfolio.total(slice(0, scenario.trials)),
@@ -1209,6 +2105,9 @@ def _run_tax_aware_trial_outcomes(
         ),
         annual_tax_audit=annual_tax_audit,
         annual_tax_strategy_actions=annual_tax_strategy_actions,
+        annual_housing=annual_housing,
+        estate_ending_balances=estate_ending_balances,
+        after_tax_estate_balances=after_tax_estate_balances,
         cumulative_irmaa_surcharge_real=(
             portfolio.cumulative_irmaa_surcharge_real
             if scenario.tax_assumptions.progressive is not None
@@ -1219,6 +2118,12 @@ def _run_tax_aware_trial_outcomes(
             if scenario.tax_assumptions.progressive is not None
             else None
         ),
+        cumulative_healthcare_shortfall_real=(
+            cumulative_healthcare_shortfall_real
+        ),
+        cumulative_ltc_shortfall_real=cumulative_ltc_shortfall_real,
+        annual_irmaa_surcharge_real=annual_irmaa_surcharge_real,
+        annual_ltc_home_equity_used=annual_ltc_home_equity_used,
     )
 
 
@@ -1229,6 +2134,8 @@ def _run_trial_outcomes(
     paths: SimulationPaths,
     annual_observer: Callable[[int, np.ndarray], None] | None = None,
     outcome_accumulator: OutcomeAccumulator | None = None,
+    allocation_observer: AllocationObserver | None = None,
+    allocation_strategy: AssetLocationStrategy | None = None,
     spending_observer: (
         Callable[
             [
@@ -1242,6 +2149,7 @@ def _run_trial_outcomes(
         | None
     ) = None,
     household_state: HouseholdState | None = None,
+    healthcare_state: HealthcareState | None = None,
     tax_engine: HouseholdTaxEngine | None = None,
 ) -> _TrialOutcomes:
     if scenario.tax_buckets:
@@ -1251,8 +2159,11 @@ def _run_trial_outcomes(
             paths=paths,
             annual_observer=annual_observer,
             outcome_accumulator=outcome_accumulator,
+            allocation_observer=allocation_observer,
+            allocation_strategy=allocation_strategy,
             spending_observer=spending_observer,
             household_state=household_state,
+            healthcare_state=healthcare_state,
             tax_engine=tax_engine,
         )
     return _run_blended_trial_outcomes(
@@ -1261,8 +2172,11 @@ def _run_trial_outcomes(
         paths=paths,
         annual_observer=annual_observer,
         outcome_accumulator=outcome_accumulator,
+        allocation_observer=allocation_observer,
+        allocation_strategy=allocation_strategy,
         spending_observer=spending_observer,
         household_state=household_state,
+        healthcare_state=healthcare_state,
     )
 
 
@@ -1272,11 +2186,15 @@ def score_simulation(
     *,
     historical_returns: Sequence[float] | None = None,
     historical_inflation: Sequence[float] | None = None,
+    historical_asset_returns: AssetHistoricalReturns | None = None,
+    named_stress: NamedStressName | None = None,
     prepared_paths: SimulationPaths | None = None,
     path_source: PathSource | BoundedPathSource | None = None,
     run_policy: RunPolicy | None = None,
     prepared_household_state: HouseholdState | None = None,
+    prepared_healthcare_state: HealthcareState | None = None,
     tax_engine: HouseholdTaxEngine | None = None,
+    allocation_strategy: AssetLocationStrategy | None = None,
 ) -> SimulationScore:
     """Evaluate success without percentiles, confidence intervals, or report metadata."""
     try:
@@ -1294,12 +2212,64 @@ def score_simulation(
         scenario,
         historical_returns=historical_returns,
         historical_inflation=historical_inflation,
+        historical_asset_returns=historical_asset_returns,
+        named_stress=named_stress,
         path_source=path_source,
         run_policy=run_policy,
     )
+    score_state_bytes = (
+        estimate_tax_state_bytes(scenario)
+        + (
+            estimate_guardrail_state_bytes(scenario.trials)
+            if scenario.retirement_spending_plan is not None
+            else 0
+        )
+        + estimate_allocation_state_bytes(
+            scenario.portfolio_allocation,
+            scenario.trials,
+            batch_size=(
+                paths.batch_size
+                if isinstance(paths, PreparedExperiment)
+                else scenario.trials
+            ),
+        )
+        + estimate_household_state_bytes(scenario)
+        + estimate_healthcare_state_bytes(scenario)
+        + estimate_housing_state_bytes(
+            scenario.trials,
+            scenario.housing_plan is not None,
+        )
+    )
+    evaluation_reservation = None
     try:
-        household_state = prepared_household_state or prepare_household_state(
+        if (
+            isinstance(paths, PreparedExperiment)
+            and score_state_bytes > 0
+        ):
+            evaluation_reservation = paths.reserve_evaluation(
+                score_state_bytes
+            )
+        household_state = prepared_household_state
+        if household_state is None:
+            household_state = prepare_household_state(
+                scenario,
+                inflation_factors=paths.inflation_factors,
+            )
+        validate_household_state(
             scenario,
+            household_state,
+            inflation_factors=paths.inflation_factors,
+        )
+        healthcare_state = prepared_healthcare_state
+        if healthcare_state is None:
+            healthcare_state = prepare_healthcare_state(
+                scenario,
+                household_state=household_state,
+                inflation_factors=paths.inflation_factors,
+            )
+        validate_healthcare_state(
+            scenario,
+            healthcare_state,
             inflation_factors=paths.inflation_factors,
         )
         outcomes = _run_trial_outcomes(
@@ -1307,7 +2277,9 @@ def score_simulation(
             starting_portfolio,
             paths=paths,
             household_state=household_state,
+            healthcare_state=healthcare_state,
             tax_engine=tax_engine,
+            allocation_strategy=allocation_strategy,
         )
         depleted = int(np.count_nonzero(~np.isnan(outcomes.depletion_ages)))
         return SimulationScore(
@@ -1316,6 +2288,8 @@ def score_simulation(
             depleted_trials=depleted,
         )
     finally:
+        if evaluation_reservation is not None:
+            evaluation_reservation.release()
         if owns_paths and isinstance(paths, PreparedExperiment):
             paths.close()
 
@@ -1326,6 +2300,7 @@ def simulate(
     *,
     historical_returns: Sequence[float] | None = None,
     historical_inflation: Sequence[float] | None = None,
+    historical_asset_returns: AssetHistoricalReturns | None = None,
     historical_source: str | None = None,
     historical_fingerprint: str | None = None,
     historical_series: HistoricalSeries | None = None,
@@ -1335,7 +2310,10 @@ def simulate(
     path_source: PathSource | BoundedPathSource | None = None,
     run_policy: RunPolicy | None = None,
     prepared_household_state: HouseholdState | None = None,
+    prepared_healthcare_state: HealthcareState | None = None,
     tax_engine: HouseholdTaxEngine | None = None,
+    allocation_strategy: AssetLocationStrategy | None = None,
+    named_stress: NamedStressName | None = None,
 ) -> SimulationResult:
     """Run a seeded parametric or historical-bootstrap retirement simulation."""
     try:
@@ -1374,6 +2352,16 @@ def simulate(
             raise ValueError("historical_fingerprint does not match the supplied historical_series")
         historical_returns = historical_series.nominal_returns
         historical_inflation = historical_series.inflation_rates
+        if (
+            historical_asset_returns is not None
+            and historical_asset_returns
+            != historical_series.asset_returns
+        ):
+            raise ValueError(
+                "historical_asset_returns do not match the supplied "
+                "historical_series"
+            )
+        historical_asset_returns = historical_series.asset_returns
         historical_source = historical_series.source
         historical_fingerprint = historical_series.sha256
 
@@ -1384,6 +2372,8 @@ def simulate(
         scenario,
         historical_returns=historical_returns,
         historical_inflation=historical_inflation,
+        historical_asset_returns=historical_asset_returns,
+        named_stress=named_stress,
         path_source=path_source,
         run_policy=run_policy,
     )
@@ -1396,6 +2386,20 @@ def simulate(
             else 0
         )
         + estimate_household_state_bytes(scenario)
+        + estimate_healthcare_state_bytes(scenario)
+        + estimate_housing_state_bytes(
+            scenario.trials,
+            scenario.housing_plan is not None,
+        )
+        + estimate_allocation_state_bytes(
+            scenario.portfolio_allocation,
+            scenario.trials,
+            batch_size=(
+                paths.batch_size
+                if isinstance(paths, PreparedExperiment)
+                else scenario.trials
+            ),
+        )
     )
     evaluation_reservation = None
     try:
@@ -1409,6 +2413,7 @@ def simulate(
             != _canonical_observation_sha256(
                 historical_series.nominal_returns,
                 historical_series.inflation_rates,
+                historical_series.asset_returns,
             )
         ):
             raise ValueError(
@@ -1416,11 +2421,50 @@ def simulate(
             )
         annual_balance_real: list[dict[str, float | int]] = []
         annual_spending_real: list[dict[str, object]] = []
+        annual_allocation_real: list[dict[str, object]] = []
 
         def observe_annual_balance(age: int, real_balances: np.ndarray) -> None:
             annual_balance_real.append({"age": age, **_percentiles(real_balances)})
 
         outcome_accumulator = OutcomeAccumulator(scenario)
+
+        def observe_annual_allocation(
+            age: int,
+            state: PortfolioAllocationState,
+            fee_real: np.ndarray,
+            turnover_real: np.ndarray,
+            rebalanced: np.ndarray,
+        ) -> None:
+            annual_allocation_real.append(
+                {
+                    "age": age,
+                    "strategy": state.strategy_identity,
+                    "rebalanced_trials": int(
+                        np.count_nonzero(rebalanced)
+                    ),
+                    "fee_real": _percentiles(fee_real),
+                    "turnover_real": _percentiles(turnover_real),
+                    "asset_weights": {
+                        name: _percentiles(values)
+                        for name, values in state.asset_weights().items()
+                    },
+                    "account_weights": {
+                        account_id: _percentiles(values)
+                        for account_id, values in (
+                            state.account_weights().items()
+                        )
+                    },
+                    "account_gross_returns": {
+                        account.account_id: _percentiles(
+                            state.account_gross_returns[index]
+                        )
+                        for index, account in enumerate(
+                            state.plan.accounts
+                        )
+                    },
+                }
+            )
+
         def observe_annual_spending(
             age: int,
             state: _GuardrailTrialState,
@@ -1471,8 +2515,27 @@ def simulate(
                     ),
                 }
             )
-        household_state = prepared_household_state or prepare_household_state(
+        household_state = prepared_household_state
+        if household_state is None:
+            household_state = prepare_household_state(
+                scenario,
+                inflation_factors=paths.inflation_factors,
+            )
+        validate_household_state(
             scenario,
+            household_state,
+            inflation_factors=paths.inflation_factors,
+        )
+        healthcare_state = prepared_healthcare_state
+        if healthcare_state is None:
+            healthcare_state = prepare_healthcare_state(
+                scenario,
+                household_state=household_state,
+                inflation_factors=paths.inflation_factors,
+            )
+        validate_healthcare_state(
+            scenario,
+            healthcare_state,
             inflation_factors=paths.inflation_factors,
         )
         outcomes = _run_trial_outcomes(
@@ -1481,6 +2544,13 @@ def simulate(
             paths=paths,
             annual_observer=observe_annual_balance if include_annual_path else None,
             outcome_accumulator=outcome_accumulator,
+            allocation_observer=(
+                observe_annual_allocation
+                if include_annual_path
+                and scenario.portfolio_allocation is not None
+                else None
+            ),
+            allocation_strategy=allocation_strategy,
             spending_observer=(
                 observe_annual_spending
                 if include_annual_path
@@ -1488,6 +2558,7 @@ def simulate(
                 else None
             ),
             household_state=household_state,
+            healthcare_state=healthcare_state,
             tax_engine=tax_engine,
         )
         depleted = int(np.count_nonzero(~np.isnan(outcomes.depletion_ages)))
@@ -1508,6 +2579,7 @@ def simulate(
             scenario,
             historical_returns=historical_returns,
             historical_inflation=historical_inflation,
+            historical_asset_returns=historical_asset_returns,
             historical_series=historical_series,
             historical_source=historical_source,
             historical_fingerprint=historical_fingerprint,
@@ -1527,16 +2599,33 @@ def simulate(
         path_generator = (
             paths.generator
             if isinstance(paths, PreparedExperiment)
-            else "provided_simulation_paths"
+            else (
+                paths.source_name
+                if isinstance(paths, MultiAssetSimulationPaths)
+                else "provided_simulation_paths"
+            )
         )
         after_tax_ending_balance_real = (
             outcomes.after_tax_ending_balances / paths.inflation_factors[years]
             if outcomes.after_tax_ending_balances is not None
             else None
         )
+        estate_value_real = (
+            outcomes.estate_ending_balances
+            / paths.inflation_factors[years]
+            if outcomes.estate_ending_balances is not None
+            else None
+        )
+        after_tax_estate_value_real = (
+            outcomes.after_tax_estate_balances
+            / paths.inflation_factors[years]
+            if outcomes.after_tax_estate_balances is not None
+            else None
+        )
         outcome_summary = outcome_accumulator.summarize(
             successful_trials=successful,
             after_tax_ending_balance_real=after_tax_ending_balance_real,
+            legacy_ending_value_real=after_tax_estate_value_real,
         )
         spending_plan = scenario.retirement_spending_plan
         spending_manifest = (
@@ -1579,6 +2668,246 @@ def simulate(
                 ),
                 "essential_floor": spending_plan.essential_floor,
             }
+        allocation_plan = scenario.portfolio_allocation
+        configured_tax_strategy = (
+            scenario.tax_assumptions.strategy
+            if scenario.tax_assumptions is not None
+            else None
+        )
+        default_allocation_identity = (
+            (
+                f"{allocation_plan.asset_location_strategy}"
+                "+tax_preference_priority_v1"
+            )
+            if allocation_plan is not None
+            and configured_tax_strategy is not None
+            and configured_tax_strategy.asset_location_preferences
+            else (
+                allocation_plan.asset_location_strategy
+                if allocation_plan is not None
+                else None
+            )
+        )
+        allocation_manifest = (
+            portfolio_allocation_manifest(
+                allocation_plan,
+                strategy_identity=(
+                        allocation_strategy.identity
+                        if allocation_strategy is not None
+                        else default_allocation_identity
+                    ),
+            ).model_dump(mode="json")
+            if allocation_plan is not None
+            else None
+        )
+        annual_healthcare_real: list[dict[str, object]] = []
+        healthcare_metrics: dict[str, object] | None = None
+        if healthcare_state is not None:
+            lifetime_pre_medicare = np.zeros(scenario.trials)
+            lifetime_medicare = np.zeros(scenario.trials)
+            lifetime_out_of_pocket = np.zeros(scenario.trials)
+            lifetime_ltc_gross = np.zeros(scenario.trials)
+            lifetime_ltc_insurance = np.zeros(scenario.trials)
+            lifetime_ltc_home_equity = np.zeros(scenario.trials)
+            lifetime_ltc_net = np.zeros(scenario.trials)
+            lifetime_base = np.zeros(scenario.trials)
+            for offset in range(retirement_offset, years):
+                inflation_factor = paths.inflation_factors[offset]
+                actual_home_equity_used = (
+                    outcomes.annual_ltc_home_equity_used[offset]
+                    if offset < len(outcomes.annual_ltc_home_equity_used)
+                    else healthcare_state.ltc_home_equity_used[offset]
+                )
+                pre_medicare_real = (
+                    healthcare_state.pre_medicare_premium[offset]
+                    / inflation_factor
+                )
+                medicare_real = (
+                    healthcare_state.medicare_premium[offset]
+                    / inflation_factor
+                )
+                out_of_pocket_real = (
+                    healthcare_state.out_of_pocket[offset]
+                    / inflation_factor
+                )
+                ltc_gross_real = (
+                    healthcare_state.ltc_gross_cost[offset]
+                    / inflation_factor
+                )
+                ltc_insurance_real = (
+                    healthcare_state.ltc_insurance_benefit[offset]
+                    / inflation_factor
+                )
+                ltc_home_equity_real = (
+                    actual_home_equity_used
+                    / inflation_factor
+                )
+                ltc_net_real = (
+                    (
+                        healthcare_state.ltc_net_cost[offset]
+                        - actual_home_equity_used
+                    )
+                    / inflation_factor
+                )
+                base_total_real = (
+                    (
+                        healthcare_state.total_cost[offset]
+                        - actual_home_equity_used
+                    )
+                    / inflation_factor
+                )
+                lifetime_pre_medicare += pre_medicare_real
+                lifetime_medicare += medicare_real
+                lifetime_out_of_pocket += out_of_pocket_real
+                lifetime_ltc_gross += ltc_gross_real
+                lifetime_ltc_insurance += ltc_insurance_real
+                lifetime_ltc_home_equity += ltc_home_equity_real
+                lifetime_ltc_net += ltc_net_real
+                lifetime_base += base_total_real
+                if not include_annual_path:
+                    continue
+                irmaa_audit = next(
+                    (
+                        item
+                        for item in outcomes.annual_irmaa_surcharge_real
+                        if item["age"] == scenario.current_age + offset
+                    ),
+                    None,
+                )
+                irmaa_real = (
+                    irmaa_audit["surcharge"]
+                    if irmaa_audit is not None
+                    else {"p10": 0.0, "p50": 0.0, "p90": 0.0}
+                )
+                annual_healthcare_real.append(
+                    {
+                        "schema_version": 2,
+                        "age": scenario.current_age + offset,
+                        "pre_medicare_aca_premium": _percentiles(
+                            pre_medicare_real
+                        ),
+                        "medicare_base_premium": _percentiles(
+                            medicare_real
+                        ),
+                        "out_of_pocket": _percentiles(
+                            out_of_pocket_real
+                        ),
+                        "ltc_gross_cost": _percentiles(
+                            ltc_gross_real
+                        ),
+                        "ltc_insurance_benefit": _percentiles(
+                            ltc_insurance_real
+                        ),
+                        "ltc_home_equity_used": _percentiles(
+                            ltc_home_equity_real
+                        ),
+                        "ltc_net_cost": _percentiles(
+                            ltc_net_real
+                        ),
+                        "irmaa_surcharge": irmaa_real,
+                        "irmaa_lookback_tax_year": (
+                            irmaa_audit["lookback_tax_year"]
+                            if irmaa_audit is not None
+                            else None
+                        ),
+                        "irmaa_lookback_source": (
+                            irmaa_audit["lookback_source"]
+                            if irmaa_audit is not None
+                            else None
+                        ),
+                        "irmaa_lookback_precedence": IRMAA_LOOKBACK_POLICY,
+                        "ltc_active_trials": int(
+                            np.count_nonzero(
+                                healthcare_state.ltc_gross_cost[offset]
+                            )
+                        ),
+                    }
+                )
+            lifetime_irmaa = (
+                outcomes.cumulative_irmaa_surcharge_real
+                if outcomes.cumulative_irmaa_surcharge_real is not None
+                else np.zeros(scenario.trials)
+            )
+            healthcare_shortfall = (
+                outcomes.cumulative_healthcare_shortfall_real
+            )
+            ltc_shortfall = outcomes.cumulative_ltc_shortfall_real
+            if healthcare_shortfall is None or ltc_shortfall is None:
+                raise RuntimeError(
+                    "healthcare shortfall outcomes were not captured"
+                )
+            healthcare_metrics = {
+                "ltc_lifetime_selection_probability": float(
+                    np.mean(healthcare_state.ltc_selected)
+                ),
+                "trials_selected_for_ltc": int(
+                    np.count_nonzero(healthcare_state.ltc_selected)
+                ),
+                "person_ltc_lifetime_selection_probability": {
+                    person_id: float(np.mean(selected))
+                    for person_id, selected in (
+                        healthcare_state.person_ltc_selected.items()
+                    )
+                },
+                "ltc_in_plan_incidence_probability": float(
+                    np.mean(healthcare_state.ltc_active_in_plan)
+                ),
+                "trials_with_in_plan_ltc": int(
+                    np.count_nonzero(
+                        healthcare_state.ltc_active_in_plan
+                    )
+                ),
+                "person_ltc_in_plan_incidence_probability": {
+                    person_id: float(np.mean(active))
+                    for person_id, active in (
+                        healthcare_state.person_ltc_active_in_plan.items()
+                    )
+                },
+                "lifetime_healthcare_cost_real": _percentiles(
+                    lifetime_base + lifetime_irmaa
+                ),
+                "lifetime_pre_medicare_aca_premium_real": _percentiles(
+                    lifetime_pre_medicare
+                ),
+                "lifetime_medicare_base_premium_real": _percentiles(
+                    lifetime_medicare
+                ),
+                "lifetime_out_of_pocket_real": _percentiles(
+                    lifetime_out_of_pocket
+                ),
+                "lifetime_irmaa_surcharge_real": _percentiles(
+                    lifetime_irmaa
+                ),
+                "lifetime_ltc_gross_cost_real": _percentiles(
+                    lifetime_ltc_gross
+                ),
+                "lifetime_ltc_insurance_benefit_real": _percentiles(
+                    lifetime_ltc_insurance
+                ),
+                "lifetime_ltc_home_equity_used_real": _percentiles(
+                    lifetime_ltc_home_equity
+                ),
+                "lifetime_ltc_net_cost_real": _percentiles(
+                    lifetime_ltc_net
+                ),
+                "lifetime_healthcare_shortfall_real": _percentiles(
+                    healthcare_shortfall
+                ),
+                "healthcare_shortfall_probability": float(
+                    np.mean(healthcare_shortfall > 0.005)
+                ),
+                "lifetime_ltc_shortfall_real": _percentiles(
+                    ltc_shortfall
+                ),
+                "ltc_shortfall_probability": float(
+                    np.mean(ltc_shortfall > 0.005)
+                ),
+                "ltc_shortfall_severity_real": (
+                    _percentiles(ltc_shortfall[ltc_shortfall > 0.005])
+                    if np.any(ltc_shortfall > 0.005)
+                    else {"p10": 0.0, "p50": 0.0, "p90": 0.0}
+                ),
+            }
 
         return SimulationResult(
             scenario=scenario.name,
@@ -1617,6 +2946,12 @@ def simulate(
             ),
             annual_tax_audit=outcomes.annual_tax_audit,
             annual_tax_strategy_actions=outcomes.annual_tax_strategy_actions,
+            annual_housing=outcomes.annual_housing,
+            housing_manifest=(
+                housing_manifest(scenario.housing_plan)
+                if scenario.housing_plan is not None
+                else None
+            ),
             annual_balance_real=annual_balance_real,
             funded_spending_ratio=outcome_summary.funded_spending_ratio,
             funded_spending_real=outcome_summary.funded_spending_real,
@@ -1626,6 +2961,16 @@ def simulate(
             recovered_trials=outcome_summary.recovered_trials,
             recovery_probability=outcome_summary.recovery_probability,
             after_tax_ending_balance_real=(outcome_summary.after_tax_ending_balance_real),
+            estate_value_real=(
+                _percentiles(estate_value_real)
+                if estate_value_real is not None
+                else None
+            ),
+            after_tax_estate_value_real=(
+                _percentiles(after_tax_estate_value_real)
+                if after_tax_estate_value_real is not None
+                else None
+            ),
             legacy_target_probability=(outcome_summary.legacy_target_probability),
             goal_outcomes=outcome_summary.goal_outcomes,
             annual_spending_real=annual_spending_real,
@@ -1633,6 +2978,9 @@ def simulate(
             household_cash_flow_audit=(
                 household_state.audit if household_state is not None else []
             ),
+            annual_allocation_real=annual_allocation_real,
+            annual_healthcare_real=annual_healthcare_real,
+            healthcare_metrics=healthcare_metrics,
             assumptions={
                 "current_age": scenario.current_age,
                 "retirement_age": scenario.retirement_age,
@@ -1646,6 +2994,31 @@ def simulate(
                 "annual_fee_rate": scenario.annual_fee_rate,
                 "withdrawal_tax_rate": scenario.withdrawal_tax_rate,
                 "cash_flow_stream_count": len(scenario.cash_flow_streams),
+                "asset_class_count": (
+                    ASSET_CLASS_COUNT
+                    if allocation_plan is not None
+                    else 1
+                ),
+                "allocation_account_count": (
+                    len(allocation_plan.accounts)
+                    if allocation_plan is not None
+                    else 0
+                ),
+                "allocation_strategy": (
+                    (
+                        allocation_strategy.identity
+                        if allocation_strategy is not None
+                        else allocation_plan.asset_location_strategy
+                    )
+                    if allocation_plan is not None
+                    else "one_asset_legacy"
+                ),
+                **(
+                    {"named_stress": paths.spec.named_stress.value}
+                    if isinstance(paths, PreparedExperiment)
+                    and paths.spec.named_stress is not None
+                    else {}
+                ),
                 **(
                     {
                         "spending_policy": spending_plan.policy.kind,
@@ -1695,6 +3068,11 @@ def simulate(
                     if scenario.household is not None
                     else 0
                 ),
+                "healthcare_policy": (
+                    scenario.healthcare.policy_id
+                    if scenario.healthcare is not None
+                    else "not_configured"
+                ),
                 **(
                     {
                         "ordinary_income_tax_rate": (
@@ -1734,7 +3112,7 @@ def simulate(
                 ),
             },
             engine={
-                "schema_version": 2,
+                "schema_version": 3,
                 "python": platform.python_version(),
                 "numpy": packages["numpy"],
                 "scipy": packages["scipy"],
@@ -1781,6 +3159,9 @@ def simulate(
                                 "second-person correlation applied after draw"
                             ),
                         },
+                        "prepared_state_binding": (
+                            "household_inputs_and_exact_inflation_factors_sha256"
+                        ),
                         "assets_after_death": "remain_in_household_portfolio",
                         "pre_retirement_household_income": (
                             "audit_only_unless_an_explicit_cash_flow_contributes_it"
@@ -1804,12 +3185,20 @@ def simulate(
                     if scenario.household is not None
                     else None
                 ),
+                "healthcare": healthcare_manifest(scenario),
                 "valuation": (
                     valuation_provenance.model_dump(mode="json")
                     if valuation_provenance is not None
                     else None
                 ),
                 "retirement_spending": spending_manifest,
+                "portfolio_allocation": allocation_manifest,
+                "multi_asset_paths": multi_asset_path_manifest(paths),
+                "housing": (
+                    housing_manifest(scenario.housing_plan)
+                    if scenario.housing_plan is not None
+                    else None
+                ),
                 "path_generator": path_generator,
             },
         )

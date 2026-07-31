@@ -116,6 +116,8 @@ def test_openapi_exposes_only_the_intended_service_surface() -> None:
         "/wealth/accounts/freshness",
         "/wealth/accounts/{account_id}/mortgage-projection",
         "/wealth/scenarios/validate",
+        "/wealth/allocations/validate",
+        "/wealth/allocations/stresses",
         "/wealth/spending-tiers/{category_id}",
         "/wealth/spending-tiers",
         "/wealth/spending-baseline",
@@ -127,6 +129,7 @@ def test_openapi_exposes_only_the_intended_service_surface() -> None:
         "/wealth/tax/calculate",
         "/wealth/tax/strategies/jobs",
         "/wealth/social-security/optimize",
+        "/wealth/housing/project",
         "/planner/jobs",
         "/planner/jobs/{job_id}",
         "/planner/jobs/{job_id}/result",
@@ -136,6 +139,8 @@ def test_openapi_exposes_only_the_intended_service_surface() -> None:
         schema["paths"]["/wealth/accounts/{account_id}/mortgage-projection"]
     ) == {"get"}
     assert set(schema["paths"]["/wealth/scenarios/validate"]) == {"post"}
+    assert set(schema["paths"]["/wealth/allocations/validate"]) == {"post"}
+    assert set(schema["paths"]["/wealth/allocations/stresses"]) == {"get"}
     assert set(schema["paths"]["/wealth/spending-tiers"]) == {"get"}
     assert set(
         schema["paths"]["/wealth/spending-tiers/{category_id}"]
@@ -154,6 +159,7 @@ def test_openapi_exposes_only_the_intended_service_surface() -> None:
     ) == {"get"}
     assert set(schema["paths"]["/wealth/tax/calculate"]) == {"post"}
     assert set(schema["paths"]["/wealth/tax/strategies/jobs"]) == {"post"}
+    assert set(schema["paths"]["/wealth/housing/project"]) == {"post"}
     assert schema["paths"]["/wealth/accounts/freshness"]["get"]["tags"] == [
         "wealth"
     ]
@@ -167,9 +173,20 @@ def test_openapi_exposes_only_the_intended_service_surface() -> None:
     assert schema["paths"]["/wealth/tax/strategies/jobs"]["post"]["tags"] == [
         "wealth"
     ]
+    assert schema["paths"]["/wealth/housing/project"]["post"]["tags"] == [
+        "wealth"
+    ]
     assert schema["paths"][
         "/wealth/accounts/{account_id}/mortgage-projection"
     ]["get"]["tags"] == ["wealth"]
+    planner_submit = schema["components"]["schemas"][
+        "PlannerJobSubmitRequest"
+    ]["properties"]
+    assert "named_stress" in planner_submit
+    comparison_submit = schema["components"]["schemas"][
+        "ScenarioComparisonCreateRequest"
+    ]["properties"]
+    assert "named_stress" in comparison_submit
 
     freshness_fields = set(
         schema["components"]["schemas"]["AccountFreshnessRead"]["properties"]
@@ -205,10 +222,16 @@ def test_openapi_exposes_only_the_intended_service_surface() -> None:
     assert schema["paths"]["/wealth/scenarios/revisions"]["post"]["security"] == [
         {"HTTPBearer": []}
     ]
+    assert schema["paths"]["/wealth/scenarios/comparisons"]["post"][
+        "security"
+    ] == [{"HTTPBearer": []}]
     assert schema["paths"]["/wealth/tax/calculate"]["post"]["security"] == [
         {"HTTPBearer": []}
     ]
     assert schema["paths"]["/wealth/tax/strategies/jobs"]["post"]["security"] == [
+        {"HTTPBearer": []}
+    ]
+    assert schema["paths"]["/wealth/housing/project"]["post"]["security"] == [
         {"HTTPBearer": []}
     ]
     assert schema["paths"][
@@ -251,6 +274,67 @@ def test_tax_calculation_matches_cli_domain_contract() -> None:
     assert payload["total_income_tax"] == 16_090.50
     assert payload["marginal_ordinary_income_tax_rate"] == pytest.approx(0.2495)
     assert payload["policy_manifest"]["policy_id"] == "us_in_2026_v1"
+
+
+def test_housing_projection_uses_exact_linked_destination_account() -> None:
+    created: list[FakeDatabase] = []
+    application = create_app(
+        application_settings=_settings(),
+        database_factory=_database_factory(created),
+    )
+    scenario = {
+        "name": "HTTP housing",
+        "current_age": 65,
+        "retirement_age": 65,
+        "end_age": 66,
+        "accounts": [{"id": "cash-reserve", "role": "cash"}],
+        "starting_portfolio": 100_000,
+        "annual_spending": 1,
+        "tax_buckets": [
+            {
+                "account_id": "cash-reserve",
+                "tax_treatment": "cash",
+                "starting_balance": 100_000,
+            }
+        ],
+        "tax_assumptions": {
+            "ordinary_income_tax_rate": 0.2,
+            "long_term_capital_gains_tax_rate": 0.15,
+            "withdrawal_order": ["cash"],
+            "retirement_surplus_destination": "cash",
+            "apply_required_minimum_distributions": False,
+        },
+        "housing_plan": {
+            "home": {
+                "current_value": 500_000,
+                "cost_basis": 500_000,
+                "annual_appreciation_rate": 0,
+            },
+            "decision": {
+                "kind": "sell",
+                "event_age": 65,
+                "proceeds_destination_account_id": "cash-reserve",
+            },
+        },
+        "trials": 100,
+    }
+
+    with TestClient(
+        application,
+        client=("127.0.0.1", 50000),
+    ) as client:
+        response = client.post(
+            "/wealth/housing/project",
+            json={"scenario": scenario},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["manifest"]["schema_version"] == 3
+    assert body["annual_housing"][0][
+        "proceeds_destination_account_id"
+    ] == "cash-reserve"
+    assert body["annual_housing"][0]["destination_tax_treatment"] == "cash"
 
 
 def test_account_freshness_uses_service_and_closes_request_database() -> None:
@@ -392,9 +476,10 @@ def test_scenario_validation_resolves_portfolio_without_running_simulation() -> 
         "starting_portfolio": 125_000.0,
         "valuation_provenance": {
             "source": "explicit_scenario_input",
-            "as_of": None,
-            "account_ids": [],
-            "source_sha256": response.json()["valuation_provenance"][
+                "as_of": None,
+                "account_ids": [],
+                "account_values": [],
+                "source_sha256": response.json()["valuation_provenance"][
                 "source_sha256"
             ],
         },

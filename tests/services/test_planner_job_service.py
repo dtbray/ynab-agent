@@ -8,6 +8,7 @@ import pytest
 
 from ynab_agent.planning.models import WealthScenario
 from ynab_agent.planning.paths import ResourceLimitError
+from ynab_agent.planning.stress import NamedStressName
 from ynab_agent.resources.historical import RegisteredHistoricalDatasets
 from ynab_agent.services.planner_jobs import (
     PlannerErrorCode,
@@ -192,17 +193,54 @@ def _scenario(**overrides: object) -> WealthScenario:
     return WealthScenario.model_validate(values)
 
 
+def _allocation() -> dict[str, object]:
+    return {
+        "market": {
+            "us_equity": {"expected_return": 0.08, "volatility": 0.18},
+            "international_equity": {
+                "expected_return": 0.07,
+                "volatility": 0.2,
+            },
+            "bonds": {"expected_return": 0.04, "volatility": 0.07},
+            "cash": {"expected_return": 0.02, "volatility": 0.01},
+            "correlation": {
+                "values": [
+                    [1, 0, 0, 0],
+                    [0, 1, 0, 0],
+                    [0, 0, 1, 0],
+                    [0, 0, 0, 1],
+                ]
+            },
+        },
+        "accounts": [
+            {
+                "account_id": "portfolio",
+                "portfolio_weight": 1,
+                "target": {
+                    "us_equity": 0.6,
+                    "international_equity": 0.2,
+                    "bonds": 0.15,
+                    "cash": 0.05,
+                },
+            }
+        ],
+    }
+
+
 def _service(
     repository: _JobRepository,
     dispatcher: _Dispatcher,
     *,
     maximum_working_bytes: int = 16 * 1024 * 1024,
     maximum_compute_units: int = 200_000_000,
+    historical_datasets: RegisteredHistoricalDatasets | None = None,
 ) -> PlannerJobService:
     return PlannerJobService(
         repository=repository,
         wealth_service=WealthService(_WealthRepository()),
-        historical_datasets=RegisteredHistoricalDatasets(),
+        historical_datasets=(
+            historical_datasets or RegisteredHistoricalDatasets()
+        ),
         dispatcher=dispatcher,
         execution_policy=PlannerExecutionPolicy(
             maximum_working_bytes=maximum_working_bytes,
@@ -270,6 +308,65 @@ async def test_historical_jobs_require_registered_dataset_ids() -> None:
 
     assert error.value.code is PlannerErrorCode.HISTORICAL_DATASET_REQUIRED
     assert repository.create_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_named_stress_selector_is_persisted_in_worker_payload() -> None:
+    repository = _JobRepository()
+    dispatcher = _Dispatcher()
+    service = _service(repository, dispatcher)
+    submitted = await service.submit(
+        PlannerJobSubmission(
+            scenario=_scenario(portfolio_allocation=_allocation()),
+            named_stress=NamedStressName.STAGFLATION,
+        )
+    )
+
+    assert submitted.job.payload.named_stress is NamedStressName.STAGFLATION
+
+
+@pytest.mark.asyncio
+async def test_registered_multi_asset_history_is_snapshotted_for_worker(
+    tmp_path,
+) -> None:
+    history_path = tmp_path / "multi-asset.csv"
+    history_path.write_text(
+        "year,nominal_return,inflation_rate,us_equity_return,"
+        "international_equity_return,bonds_return,cash_return\n"
+        "2020,0.10,0.02,0.11,0.12,0.01,0.001\n"
+        "2021,-0.10,0.03,-0.21,-0.22,0.02,0.002\n",
+        encoding="utf-8",
+    )
+    datasets = RegisteredHistoricalDatasets.from_paths(
+        {"multi-market": history_path}
+    )
+    repository = _JobRepository()
+    dispatcher = _Dispatcher()
+    service = _service(
+        repository,
+        dispatcher,
+        historical_datasets=datasets,
+    )
+
+    submitted = await service.submit(
+        PlannerJobSubmission(
+            scenario=_scenario(
+                return_model="historical_bootstrap",
+                historical_block_size=1,
+                portfolio_allocation=_allocation(),
+            ),
+            historical_dataset_id="multi-market",
+        )
+    )
+
+    snapshot = submitted.job.payload.historical_dataset
+    assert snapshot is not None
+    assert snapshot.asset_returns == (
+        (0.11, -0.21),
+        (0.12, -0.22),
+        (0.01, 0.02),
+        (0.001, 0.002),
+    )
 
 
 @pytest.mark.asyncio
