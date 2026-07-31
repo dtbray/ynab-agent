@@ -189,6 +189,7 @@ def test_result_has_a_versioned_serializable_reproducibility_contract() -> None:
         "source": "persisted_account_valuations",
         "as_of": "2026-07-28",
         "account_ids": ["retirement", "brokerage"],
+        "account_values": [],
         "source_sha256": "abc123",
     }
     assert manifest["run_policy"] == {
@@ -211,7 +212,7 @@ def test_result_has_a_versioned_serializable_reproducibility_contract() -> None:
     assert manifest["historical"] is None
     assert manifest["bootstrap"] is None
     assert result.assumptions["scenario_sha256"] == canonical_scenario_sha256(scenario)
-    assert result.engine["schema_version"] == 2
+    assert result.engine["schema_version"] == 3
     outcome_semantics = manifest["outcome_semantics"]
     assert isinstance(outcome_semantics, dict)
     assert outcome_semantics["schema_version"] == 2

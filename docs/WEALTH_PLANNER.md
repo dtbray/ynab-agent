@@ -257,6 +257,144 @@ received before the scenario retirement milestone are audited but are not
 automatically invested. Model those savings with an explicit contribution
 cash-flow stream.
 
+## Multi-asset allocation and correlated returns
+
+Add `portfolio_allocation` to model US equity, international equity, bonds,
+and cash separately. Market assumptions are independent from allocation
+strategy, so scenarios with different account targets can reuse the same
+seeded common market paths:
+
+```json
+{
+  "portfolio_allocation": {
+    "market": {
+      "us_equity": {"expected_return": 0.08, "volatility": 0.18},
+      "international_equity": {
+        "expected_return": 0.07,
+        "volatility": 0.20
+      },
+      "bonds": {"expected_return": 0.04, "volatility": 0.07},
+      "cash": {"expected_return": 0.025, "volatility": 0.01},
+      "correlation": {
+        "values": [
+          [1, 0.75, -0.10, 0],
+          [0.75, 1, -0.10, 0],
+          [-0.10, -0.10, 1, 0.20],
+          [0, 0, 0.20, 1]
+        ]
+      }
+    },
+    "accounts": [
+      {
+        "account_id": "ynab-401k-account-id",
+        "portfolio_weight": 0.8,
+        "annual_fee_rate": 0.003,
+        "target": {
+          "us_equity": 0.7,
+          "international_equity": 0.2,
+          "bonds": 0.1,
+          "cash": 0
+        },
+        "glide_path": [
+          {
+            "age": 60,
+            "weights": {
+              "us_equity": 0.5,
+              "international_equity": 0.15,
+              "bonds": 0.3,
+              "cash": 0.05
+            }
+          }
+        ]
+      },
+      {
+        "account_id": "ynab-brokerage-account-id",
+        "portfolio_weight": 0.2,
+        "target": {
+          "us_equity": 0.5,
+          "international_equity": 0.3,
+          "bonds": 0.1,
+          "cash": 0.1
+        }
+      }
+    ],
+    "rebalancing": {
+      "frequency_years": 1,
+      "drift_threshold": 0.05
+    }
+  }
+}
+```
+
+The correlation matrix order is US equity, international equity, bonds, then
+cash. It must be symmetric, have ones on its diagonal, contain only values
+from -1 through 1, and be positive semidefinite. These are requested
+correlations of annual simple returns. The engine transforms them into the
+lognormal covariance required for sampling and rejects inputs when that
+transformed matrix is not positive semidefinite. Account and asset weights
+must each total one. Glide-path targets interpolate linearly by age.
+`frequency_years: 1` checks rebalancing annually; set it to another bounded
+interval or `null` to disable scheduled rebalancing. A drift threshold can
+skip trades while weights remain close to target.
+
+Validate the exact same canonical representation through either interface:
+
+```bash
+ynab wealth allocation validate --plan allocation.local.json --json
+```
+
+```text
+POST /wealth/allocations/validate
+```
+
+Parametric multi-asset paths use correlated lognormal shocks. Account fees and
+the legacy global fee are deducted before rebalancing. Every annual result
+records real fee and turnover percentiles, rebalanced-trial counts, and
+post-rebalancing account and asset weights in `annual_allocation_real`.
+It also records each account's effective gross return after its allocation
+and fees. When `accounts` selects live liquid YNAB accounts, the allocation
+must cover that set exactly; partial coverage is rejected.
+`reproducibility.portfolio_allocation` contains the full assumptions,
+covariance matrix, strategy identity, and SHA-256 fingerprint.
+
+For a multi-asset historical bootstrap, add all four asset-return columns to
+the existing CSV. `nominal_return` remains required as the compatible
+one-asset series:
+
+```csv
+year,nominal_return,inflation_rate,us_equity_return,international_equity_return,bonds_return,cash_return
+2021,0.18,0.07,0.25,0.08,-0.02,0.001
+2022,-0.16,0.065,-0.19,-0.16,-0.12,0.015
+2023,0.21,0.034,0.26,0.18,0.05,0.045
+```
+
+The bootstrap samples one index sequence for all four assets and inflation,
+preserving their observed same-year relationship and multi-year blocks. The
+same format is accepted by `--returns` and by server-registered planner
+datasets. A multi-asset historical run fails clearly if any asset column is
+missing.
+
+The bounded named-stress catalog is available through both adapters:
+
+```bash
+ynab wealth allocation stresses --json
+ynab wealth simulate --scenario allocation.local.json --stress equity_crash
+ynab wealth scenarios compare \
+  --baseline BASELINE_UUID \
+  --alternative ALTERNATIVE_UUID \
+  --named-stress equity_crash
+```
+
+```text
+GET /wealth/allocations/stresses
+POST /planner/jobs
+{"scenario": {...}, "named_stress": "equity_crash"}
+```
+
+Catalog definitions and their SHA-256 fingerprints are versioned in results.
+Each finite sequence repeats for a longer scenario horizon, allowing clients
+to submit the same scenario once per selector for deterministic comparisons.
+
 ## Age-bounded cash flows and mortgage payoff
 
 Use `cash_flow_streams` for recurring amounts that begin or end at a known age.
@@ -293,10 +431,14 @@ amortization schedule.
 
 ## Account-aware taxes
 
-The optional account-aware tax model replaces `withdrawal_tax_rate` with explicit aggregate
-balances for `tax_deferred`, `roth`, `taxable`, `hsa`, and `cash` treatments.
-At most one bucket per treatment is allowed, and bucket balances must equal the
-explicit `starting_portfolio`. Taxable buckets require an estimated cost basis.
+The optional account-aware tax model replaces `withdrawal_tax_rate` with
+explicit balances for `tax_deferred`, `roth`, `taxable`, `hsa`, and `cash`
+treatments. Aggregate scenarios may omit account IDs. Multi-account allocation
+scenarios link each bucket to exactly one selected liquid account with
+`account_id`; this permits multiple accounts with the same owner and treatment
+without conflating their returns, basis, tax drag, withdrawals, or strategy
+projections. Linked bucket balances and allocation weights must reconcile to
+the account observations. Taxable buckets require an estimated cost basis.
 Contribution fractions describe where the base annual contribution lands:
 
 ```json
@@ -304,20 +446,24 @@ Contribution fractions describe where the base annual contribution lands:
   "tax_buckets": [
     {
       "tax_treatment": "tax_deferred",
+      "account_id": "ynab-401k-account-id",
       "starting_balance": 102700.39,
       "contribution_fraction": 1
     },
     {
       "tax_treatment": "roth",
+      "account_id": "ynab-roth-account-id",
       "starting_balance": 40575.23
     },
     {
       "tax_treatment": "taxable",
+      "account_id": "ynab-brokerage-account-id",
       "starting_balance": 1724.01,
       "taxable_basis": 1724.01
     },
     {
       "tax_treatment": "hsa",
+      "account_id": "ynab-hsa-account-id",
       "starting_balance": 784.51
     }
   ],
@@ -345,6 +491,11 @@ Every tax-aware income stream must declare `ordinary`, `social_security`, or
 `tax_free`. Contribution cash-flow streams may set
 `destination_tax_treatment`; otherwise they use the bucket contribution
 fractions.
+
+Live linked scenarios persist the sorted account/value observations in
+valuation provenance. Submission fails closed if a bucket balance or
+allocation share differs from the resolved YNAB account value, and later YNAB
+changes cannot alter a saved revision's replay inputs.
 
 The `effective_rates` engine applies the configured effective ordinary-income rate to
 tax-deferred withdrawals and the configured capital-gains rate only to the
@@ -408,8 +559,9 @@ ynab wealth tax --input annual-tax.local.json --json
 and as `POST /wealth/tax/calculate`. It reports federal and Indiana components,
 effective and $1 marginal rates, ACA expected-contribution and premium-tax-
 credit hooks, and the two-year Medicare IRMAA lookback tier and surcharge.
-ACA credits and Medicare premiums are audit fields only until the separate
-healthcare-premium cash-flow model consumes them.
+The standalone tax calculation keeps those as audit fields. A simulation with
+`healthcare` assumptions consumes explicit net ACA premiums, Medicare base
+premiums, out-of-pocket costs, and IRMAA as healthcare cash flows.
 
 ### Tax-strategy comparisons
 
@@ -475,8 +627,41 @@ Simulation output includes `annual_tax_strategy_actions` with P10/P50/P90
 conversion, gain-harvest, and per-treatment withdrawal amounts. It also
 includes required minimum distributions in the tax-deferred withdrawal total.
 It also reports annual IRMAA surcharges from the two-year MAGI lookback, real
-lifetime IRMAA surcharge, and exposure probability. IRMAA remains an audit
-outcome, not a healthcare-premium cash flow.
+lifetime IRMAA surcharge, and exposure probability. Simulation engine v12
+charges IRMAA exactly once as a healthcare cash flow. Tier thresholds use the
+filing status on the lookback-year return; current-year survival and each
+person's configured `medicare_start_age` determine only how many enrolled
+people owe the surcharge. An exact supplied tax-year-minus-two observation
+overrides simulated MAGI for the same year; the selected source and precedence
+are persisted in healthcare and tax audits and replay manifests. Historical
+lookback entries can set
+`filing_status`; when omitted it is inferred from the scenario's initial
+status. A separate historical "MFS lived with spouse" fact is not modeled, so
+the scenario-wide `married_filing_separately_lived_with_spouse` flag applies
+to those entries. Do not also include IRMAA in `annual_spending`.
+
+### Healthcare and long-term care
+
+An optional `healthcare` object covers every configured household person
+exactly once. Pre-Medicare premiums are explicit ACA or other premiums net of
+any expected premium tax credit. Medicare premiums exclude IRMAA, which the
+progressive tax policy calculates separately. Routine costs and LTC severity
+follow `medical_inflation_rate`. Set `ltc_funding_source` to `portfolio` or
+`home_equity`. Home-equity funding requires a positive real funding limit and
+a reserve-only `housing_plan.care` naming the exact cash or taxable proceeds
+account. Each year's post-insurance LTC demand is debited from that account,
+up to the inflation-adjusted limit; only the actual unmet amount falls back to
+normal portfolio spending.
+
+LTC assumptions separately declare lifetime selection probability, bounded
+onset, duration, lognormal cost severity, and insurance benefits. Results
+distinguish the lifetime Bernoulli selection from care that actually becomes
+active during the simulated retirement window, then report insurance,
+home-equity use, portfolio cost, and conditional shortfall severity. These
+costs are incremental: exclude them from `annual_spending` and spending-plan
+baselines. Healthcare LTC assumptions are the single cost source when the
+housing care object is reserve-only. A deterministic housing care schedule and
+person-level healthcare LTC cannot be configured together.
 
 For human review:
 
@@ -548,6 +733,62 @@ impression of cent-level precision from Monte Carlo output. Use
 whole years. Simulation output includes a 95% Wilson confidence interval for
 the observed success rate.
 
+## Model housing decisions without making the house spendable
+
+Add `housing_plan` only to an account-aware scenario with explicit tax buckets.
+The configured home value is separate from `starting_portfolio`: a `keep`
+decision can raise the reported estate, but it can never fund spending. Cash
+enters the portfolio only through an explicit `sell`, `downsize`, `replace`,
+`rent`, or `reverse_mortgage` event. Every such event names one exact linked
+`cash` or `taxable` account with `proceeds_destination_account_id`; proceeds
+are never distributed across accounts merely because they share a tax
+treatment or owner.
+
+Housing assumptions cover current value and cost basis, appreciation,
+maintenance, property tax, insurance, selling costs, and a fixed-rate
+remaining mortgage schedule. Replacement homes inherit those property-rate
+assumptions, and their new mortgage cannot exceed property value. An optional
+care plan adds real annual spending. Its optional `funding_account_id` must be
+the exact proceeds destination of a home-equity liquidity event no later than
+care begins. That reserve is debited first, and only unmet care falls back to
+the normal portfolio withdrawal policy, avoiding double-counted spending.
+Liquidity events, portfolio-funded housing costs, and care cannot begin before
+`retirement_age`; earlier forward-mortgage payments and carrying costs remain
+externally funded.
+
+A reverse mortgage is modeled as gross nonrecourse principal. It is bounded by
+`reverse_mortgage_max_ltv` (80% by default), pays origination costs and the
+existing forward lien before creating portfolio cash, and stops that lien's
+payment schedule. At terminal disposition, reverse debt can consume the
+collateral but cannot create a negative estate claim.
+
+For a sale, selling costs, mortgage debt, the primary-residence gain exclusion,
+and taxable gain are audited separately. The progressive engine stacks that
+gain with the same year's modeled ordinary income, Social Security, RMDs, and
+withdrawals, then funds one combined liability. Net proceeds are deposited at
+the start of the event year, before allocation alignment and account-specific
+returns; an external deposit to a taxable account increases securities basis
+exactly once while the home gain remains separately auditable. This is a bounded planning
+estimate—not tax-preparation fidelity—and excludes unmodeled earned income,
+deductions, local rules, and transaction details.
+At the terminal estate calculation, home disposition gain stacks with
+tax-deferred, nonqualified HSA, and taxable-account liquidation on one modeled
+return rather than receiving an independent set of brackets.
+
+Project the deterministic housing ledger before running Monte Carlo:
+
+```bash
+ynab wealth housing project \
+  --scenario examples/housing-scenario.example.json \
+  --json
+```
+
+The authenticated HTTP equivalent is `POST /wealth/housing/project` with
+`{"scenario": ...}`. CLI and HTTP return the same manifest, annual
+home/equity/cash-flow/action rows, and ending disposition estimate. Full
+simulation output additionally reports liquid ending balance separately from
+housing-inclusive before- and after-tax estate percentiles.
+
 ## Save and compare scenario revisions
 
 Save a scenario after its live YNAB account values have been resolved:
@@ -561,7 +802,7 @@ ynab wealth scenarios save \
 The returned UUID identifies an immutable revision. Saving another file with
 the same scenario `name` appends the next revision; it never edits the prior
 one. Each revision manifest records the complete resolved scenario, starting
-portfolio and valuation provenance, engine identity, and—when historical
+portfolio and per-account valuation provenance, engine identity, and—when historical
 bootstrapping is used—the exact observations and their fingerprints.
 
 Compare one baseline with one or more alternatives:
@@ -570,6 +811,7 @@ Compare one baseline with one or more alternatives:
 ynab wealth scenarios compare \
   --baseline 00000000-0000-4000-8000-000000000001 \
   --alternative 00000000-0000-4000-8000-000000000002 \
+  --named-stress equity_crash \
   --json
 ```
 
@@ -579,6 +821,9 @@ observations. The engine prepares those return and inflation paths once and
 uses the same arrays for every revision, so the delta reflects scenario inputs
 rather than unrelated Monte Carlo noise. Generated arrays are closed after the
 comparison and are never persisted.
+The optional named-stress selector is part of the common-path manifest and
+comparison hash. It is replayed through the same registered stress definition
+for every alternative; generated arrays remain ephemeral.
 
 The stable comparison model reports success probability, requested and
 cumulatively funded spending, cumulative shortfall, lifetime taxes when the
@@ -675,15 +920,16 @@ the YNAB API cache does not yet retain dated balance snapshots.
 
 ## Model boundary
 
-The default model uses independent annual lognormal returns described by an
-arithmetic mean and volatility. The historical model uses a stationary block
-bootstrap, which retains multi-year return sequences and can retain paired
-inflation observations. Contributions occur after each pre-retirement year's
-return, including active contribution cash-flow streams. Retirement spending
-includes active expense cash-flow streams, then subtracts active income
-streams, and is withdrawn after each retirement year's return. Fees reduce gross
-returns. A scenario may use either the legacy blended withdrawal tax rate or
-the explicit account-aware tax model.
+The default one-asset model uses independent annual lognormal returns described
+by an arithmetic mean and volatility. The multi-asset model draws correlated
+lognormal shocks from the validated market matrix. The historical model uses a
+stationary block bootstrap, which retains multi-year return sequences and can
+retain paired inflation observations. Contributions occur after each
+pre-retirement year's return, including active contribution cash-flow streams.
+Retirement spending includes active expense cash-flow streams, then subtracts
+active income streams, and is withdrawn after each retirement year's return.
+Fees reduce gross returns. A scenario may use either the legacy blended
+withdrawal tax rate or the explicit account-aware tax model.
 
 The example scenario uses a VTSAX-like total-stock-market profile: a
 conservative 6% nominal arithmetic return and 16% annual volatility. These are
@@ -696,21 +942,21 @@ financial advice.
 
 Important limitations:
 
-- One blended return process is applied to the selected liquid portfolio.
-- Parametric returns are independent and do not model regime changes.
+- Parametric return vectors are independent from year to year and do not model
+  regime changes.
 - Historical results are bounded by the quality and representativeness of the
   supplied observation set.
 - Runs are limited to 100,000 trials until the engine supports bounded
   batch-wise percentile aggregation.
 - Account-aware taxes use explicit effective rates rather than progressive
   federal and state tax-return calculations.
-- YNAB has account balances, not security holdings or asset allocation.
+- YNAB has account balances, not security holdings; allocations are explicit
+  planning assumptions.
 - YNAB investment tracking does not distinguish market gains from
   reconciliation adjustments.
 - Social Security PIAs and pension amounts should come from authoritative
   personal estimates.
 
 Natural next steps are periodic balance snapshots, side-by-side scenario
-comparison, asset-class allocations and covariance, longevity sampling,
-progressive tax-policy plugins, Roth-conversion strategies, and versioned
-economic assumption sets.
+comparison, longevity sampling, progressive tax-policy plugins,
+Roth-conversion strategies, and versioned economic assumption sets.

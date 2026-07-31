@@ -53,13 +53,17 @@ COMMAND_TREE = {
         "simulate",
         "solve",
         "performance",
+        "allocation",
         "spending",
         "scenarios",
         "tax",
         "tax-strategy",
+        "housing",
     },
+    ("wealth", "allocation"): {"validate", "stresses"},
     ("wealth", "spending"): {"map", "list", "baseline", "preview"},
     ("wealth", "scenarios"): {"save", "compare"},
+    ("wealth", "housing"): {"project"},
 }
 
 LEAF_COMMANDS = (
@@ -94,10 +98,13 @@ LEAF_COMMANDS = (
     ("wealth", "accounts"),
     ("wealth", "tax"),
     ("wealth", "tax-strategy"),
+    ("wealth", "housing", "project"),
     ("wealth", "optimize-social-security"),
     ("wealth", "simulate"),
     ("wealth", "solve"),
     ("wealth", "performance"),
+    ("wealth", "allocation", "validate"),
+    ("wealth", "allocation", "stresses"),
     ("wealth", "spending", "map"),
     ("wealth", "spending", "list"),
     ("wealth", "spending", "baseline"),
@@ -135,6 +142,7 @@ CRITICAL_OPTIONS = {
     ("wealth", "simulate"): {
         "--scenario",
         "--returns",
+        "--stress",
         "--html",
         "--json",
     },
@@ -149,6 +157,7 @@ CRITICAL_OPTIONS = {
         "--upper",
         "--target-success",
         "--returns",
+        "--stress",
         "--html",
         "--json",
     },
@@ -169,6 +178,7 @@ CRITICAL_OPTIONS = {
         "--json",
     },
     ("wealth", "tax"): {"--input", "--json"},
+    ("wealth", "housing", "project"): {"--scenario", "--json"},
     ("wealth", "tax-strategy"): {"--scenario", "--returns", "--json"},
 }
 

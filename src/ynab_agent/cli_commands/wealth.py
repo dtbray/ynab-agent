@@ -30,6 +30,7 @@ from ynab_agent.planning.reporting import write_simulation_html
 from ynab_agent.planning.simulation import SimulationResult, simulate
 from ynab_agent.planning.social_security_optimizer import optimize_social_security
 from ynab_agent.planning.solver import SolveVariable, solve_scenario
+from ynab_agent.planning.stress import NamedStressName
 from ynab_agent.runtime import open_wealth_service
 from ynab_agent.services.wealth import ResolvedStartingPortfolio
 
@@ -246,6 +247,13 @@ def simulate_command(
             help="CSV with year, nominal_return, and optional inflation_rate columns",
         ),
     ] = None,
+    named_stress: Annotated[
+        NamedStressName | None,
+        typer.Option(
+            "--stress",
+            help="Run one bounded named multi-asset stress instead of random paths",
+        ),
+    ] = None,
     html_path: Annotated[
         Path | None,
         typer.Option(
@@ -261,7 +269,7 @@ def simulate_command(
 ) -> None:
     """Run a seeded parametric or historical retirement simulation."""
     scenario = load_scenario(scenario_path)
-    history = load_history(scenario, returns_path)
+    history = load_history(scenario, returns_path, named_stress)
 
     async def run() -> None:
         try:
@@ -271,6 +279,7 @@ def simulate_command(
                 starting_portfolio.value,
                 historical_series=history,
                 valuation_provenance=starting_portfolio.provenance,
+                named_stress=named_stress,
             )
             written_html = (
                 write_simulation_html(result, html_path)
@@ -598,6 +607,13 @@ def solve_command(
             help="Historical returns CSV required by historical_bootstrap scenarios",
         ),
     ] = None,
+    named_stress: Annotated[
+        NamedStressName | None,
+        typer.Option(
+            "--stress",
+            help="Solve against one bounded named multi-asset stress",
+        ),
+    ] = None,
     html_path: Annotated[
         Path | None,
         typer.Option(
@@ -613,7 +629,7 @@ def solve_command(
 ) -> None:
     """Solve a spending, contribution, portfolio, or retirement-age threshold."""
     scenario = load_scenario(scenario_path)
-    history = load_history(scenario, returns_path)
+    history = load_history(scenario, returns_path, named_stress)
 
     async def run() -> None:
         try:
@@ -628,6 +644,7 @@ def solve_command(
                 resolution=resolution,
                 historical_series=history,
                 valuation_provenance=starting_portfolio.provenance,
+                named_stress=named_stress,
             )
             written_html = (
                 write_simulation_html(result.simulation, html_path)

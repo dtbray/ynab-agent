@@ -107,9 +107,10 @@ async def test_social_security_executor_uses_shared_admission_and_aggregate_comp
     assert result.manifest["starting_portfolio"] == 100_000
     assert result.manifest["valuation_provenance"] == {
         "source": "test",
-        "as_of": None,
-        "account_ids": [],
-        "source_sha256": "test-snapshot",
+            "as_of": None,
+            "account_ids": [],
+            "account_values": [],
+            "source_sha256": "test-snapshot",
     }
     assert worker.required_working_bytes == (
         policy.required_social_security_optimization_working_bytes(

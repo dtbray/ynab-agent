@@ -2,17 +2,66 @@
 
 ## Unreleased
 
+## 0.8.0 - 2026-07-30
+
 ### Added
+- Model household pre-Medicare/ACA, Medicare, out-of-pocket, and separately
+  inflated healthcare costs plus seeded long-term-care incidence, duration,
+  severity, insurance, and shared home-equity funding.
+- Report lifetime and annual healthcare costs, LTC lifetime selection and
+  in-plan incidence, funding sources, and conditional shortfall severity with
+  replayable assumptions in CLI and HTTP planner results.
+- Model homes as explicit illiquid assets with mortgage amortization,
+  appreciation, carrying costs, selling costs, and bounded care spending.
+- Add auditable keep, sell, downsize, replace, rent, and reverse-mortgage
+  decisions plus CLI and authenticated HTTP housing projections.
+- Compare housing alternatives on common market paths and report
+  housing-inclusive before- and after-tax estates.
 - Add allowlisted, fail-closed private-source automation that exports and
   verifies the public distribution before opening a protected GitHub pull
   request.
 - Publish source and wheel artifacts as a GitHub release after a release-sync
   pull request passes review and is merged.
 
+### Fixed
+- Route realized home-equity proceeds to one exact linked account, preserving
+  duplicate-owner/treatment isolation and taxable basis exactly once.
+- Apply net housing proceeds before event-year allocation and account returns,
+  while keeping gross proceeds, costs, liens, replacement cash, and shortfalls
+  separately auditable.
+- Stack annual and terminal home gains with tax strategies, household filing
+  status, and every keyed portfolio account on one modeled tax return.
+- Route allocation, fee, rebalance, and glide-path returns through stable
+  account-linked tax buckets instead of applying one blended return to every
+  tax treatment.
+- Persist and replay named-stress selectors for saved common-path comparisons
+  through the CLI, authenticated HTTP API, canonical hashes, and manifests.
+- Fail closed when allocation coverage or live linked account valuations do
+  not exactly match the selected liquid YNAB accounts.
+- Prefer supplied exact IRMAA lookback history over simulated MAGI for the
+  same tax year, including post-start observations, and persist provenance.
+
 ### Changed
+- Charge IRMAA as a survivor- and enrollment-aware healthcare cash flow in
+  simulation engine v11 instead of reporting it only as an audit outcome.
+  Scenarios that already include IRMAA in `annual_spending` must remove it to
+  avoid double counting.
+- Apply IRMAA tier thresholds from the filing status on the two-year lookback
+  return while using current-year alive, Medicare-enrolled people only as the
+  surcharge multiplier.
+- Advance planner result, reproducibility, job, comparison, housing-manifest,
+  and simulation-engine versions for account-keyed housing replay.
+- Fund home-equity care through a typed exact-account reserve port, with only
+  unmet care falling back to normal portfolio spending.
+- Treat person-level healthcare LTC as the sole cost source when using a
+  reserve-only housing care plan; reject conflicting deterministic care costs.
 - Declare complete SPDX license, author, project URL, classifier, keyword, and
   typing metadata in built distributions.
 - Build and validate both source distributions and wheels in public CI.
+- Execute asset-location preferences with a deterministic capacity-constrained
+  placement policy and expose per-account effective returns in annual audits.
+- Persist account-by-account valuation observations so later YNAB changes
+  cannot alter saved planner inputs.
 
 ## 0.7.0 - 2026-07-30
 

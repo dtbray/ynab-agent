@@ -158,6 +158,29 @@ def test_irmaa_top_threshold_is_inclusive_and_charged_per_eligible_person() -> N
     assert joint.irmaa_annual_surcharge == pytest.approx(2 * top_surcharge)
 
 
+def test_irmaa_uses_lookback_return_filing_status() -> None:
+    result = calculate_annual_tax(
+        TaxCalculationInput(
+            filing_status="married_filing_jointly",
+            taxpayer_birth_year=1950,
+            spouse_birth_year=1950,
+            irmaa_lookback_magi=[
+                {
+                    "tax_year": 2024,
+                    "magi": 150_000,
+                    "filing_status": "single",
+                }
+            ],
+        )
+    )
+
+    assert result.irmaa_lookback_filing_status == "single"
+    assert result.irmaa_tier == 2
+    assert result.irmaa_annual_surcharge == pytest.approx(
+        2 * 12 * (202.90 + 37.50)
+    )
+
+
 @pytest.mark.parametrize(
     ("magi", "expected_tier", "expected_monthly_adjustment"),
     [

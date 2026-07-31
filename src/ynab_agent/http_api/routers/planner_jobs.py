@@ -59,6 +59,7 @@ async def submit_planner_job(
                     request.scenario.model_dump()
                 ),
                 historical_dataset_id=request.historical_dataset_id,
+                named_stress=request.named_stress,
             )
         )
     except PlannerJobServiceError as exc:

@@ -7,6 +7,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from ynab_agent.planning.allocation import PortfolioAllocationPlan
+from ynab_agent.planning.healthcare_models import HealthcareAssumptions
 from ynab_agent.planning.spending_guardrails import (
     RetirementSpendingPlan,
 )
@@ -26,6 +28,12 @@ MAX_SPENDING_TIER_NAME_LENGTH = 100
 MAX_IRMAA_LOOKBACK_YEARS = 2
 MAX_ASSET_LOCATION_PREFERENCES = 16
 MAX_ASSET_CLASS_NAME_LENGTH = 64
+SUPPORTED_ASSET_LOCATION_CLASSES = {
+    "us_equity",
+    "international_equity",
+    "bonds",
+    "cash",
+}
 
 
 class AccountRole(StrEnum):
@@ -62,6 +70,146 @@ class TaxTreatment(StrEnum):
     TAXABLE = "taxable"
     HSA = "hsa"
     CASH = "cash"
+
+
+class HousingDecisionKind(StrEnum):
+    """A deliberate event that can change an otherwise illiquid home."""
+
+    KEEP = "keep"
+    SELL = "sell"
+    DOWNSIZE = "downsize"
+    REPLACE = "replace"
+    RENT = "rent"
+    REVERSE_MORTGAGE = "reverse_mortgage"
+
+
+class MortgageAssumptions(BaseModel):
+    """A fixed-rate, fully amortizing mortgage balance and remaining term."""
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    principal: float = Field(ge=0)
+    annual_interest_rate: float = Field(default=0, ge=0, le=0.3)
+    remaining_years: int = Field(default=0, ge=0, le=50)
+
+    @model_validator(mode="after")
+    def validate_term(self) -> MortgageAssumptions:
+        if (self.principal > 0) != (self.remaining_years > 0):
+            raise ValueError("mortgage principal and remaining_years must both be positive or zero")
+        return self
+
+
+class HomeAsset(BaseModel):
+    """Explicit illiquid home valuation and bounded carrying assumptions."""
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    current_value: float = Field(gt=0)
+    cost_basis: float = Field(gt=0)
+    annual_appreciation_rate: float = Field(default=0.025, ge=-0.2, le=0.3)
+    maintenance_rate: float = Field(default=0.01, ge=0, le=0.2)
+    property_tax_rate: float = Field(default=0.01, ge=0, le=0.2)
+    insurance_rate: float = Field(default=0.005, ge=0, le=0.2)
+    selling_cost_rate: float = Field(default=0.07, ge=0, le=0.25)
+    mortgage: MortgageAssumptions = Field(
+        default_factory=lambda: MortgageAssumptions(principal=0, remaining_years=0)
+    )
+
+
+class HousingDecision(BaseModel):
+    """One explicit housing action, modeled at the start of ``event_age``."""
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    kind: HousingDecisionKind = HousingDecisionKind.KEEP
+    event_age: int | None = Field(default=None, ge=0, le=130)
+    proceeds_destination_account_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MAX_ACCOUNT_ID_LENGTH,
+    )
+    replacement_home_value: float | None = Field(default=None, gt=0)
+    replacement_mortgage: MortgageAssumptions | None = None
+    annual_rent_real: float | None = Field(default=None, ge=0)
+    reverse_mortgage_principal: float | None = Field(default=None, gt=0)
+    reverse_mortgage_max_ltv: float = Field(default=0.8, gt=0, le=1)
+    reverse_mortgage_interest_rate: float = Field(default=0.07, ge=0, le=0.3)
+    reverse_mortgage_origination_rate: float = Field(default=0.03, ge=0, le=0.2)
+
+    @model_validator(mode="after")
+    def validate_action(self) -> HousingDecision:
+        liquid = self.kind is not HousingDecisionKind.KEEP
+        if liquid != (self.event_age is not None):
+            raise ValueError("non-keep housing decisions require event_age; keep must omit it")
+        if liquid != (self.proceeds_destination_account_id is not None):
+            raise ValueError(
+                "housing liquidity events require proceeds_destination_account_id; "
+                "keep must omit it"
+            )
+        replacement = self.kind in {
+            HousingDecisionKind.DOWNSIZE,
+            HousingDecisionKind.REPLACE,
+        }
+        if replacement != (self.replacement_home_value is not None):
+            raise ValueError("downsize/replace require replacement_home_value only")
+        if not replacement and self.replacement_mortgage is not None:
+            raise ValueError("replacement_mortgage requires downsize or replace")
+        if (self.kind is HousingDecisionKind.RENT) != (self.annual_rent_real is not None):
+            raise ValueError("rent requires annual_rent_real only")
+        reverse = self.kind is HousingDecisionKind.REVERSE_MORTGAGE
+        if reverse != (self.reverse_mortgage_principal is not None):
+            raise ValueError("reverse_mortgage requires reverse_mortgage_principal only")
+        return self
+
+
+class CareFundingPlan(BaseModel):
+    """Deterministic care costs or an exact-account reserve for healthcare LTC."""
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    start_age: int | None = Field(default=None, ge=0, le=130)
+    end_age: int | None = Field(default=None, ge=0, le=130)
+    annual_cost_real: float | None = Field(default=None, gt=0)
+    funding_account_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MAX_ACCOUNT_ID_LENGTH,
+        description=(
+            "Exact cash or taxable account containing realized home-equity "
+            "proceeds. Funded care is debited here before any portfolio fallback."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_ages(self) -> CareFundingPlan:
+        cost_fields = (self.start_age, self.end_age, self.annual_cost_real)
+        if any(value is not None for value in cost_fields) and not all(
+            value is not None for value in cost_fields
+        ):
+            raise ValueError(
+                "deterministic care requires start_age, end_age, and annual_cost_real together"
+            )
+        if (
+            self.start_age is not None
+            and self.end_age is not None
+            and self.end_age < self.start_age
+        ):
+            raise ValueError("care end_age must be at least start_age")
+        if all(value is None for value in cost_fields) and self.funding_account_id is None:
+            raise ValueError("a reserve-only care plan requires funding_account_id")
+        return self
+
+
+class HousingPlan(BaseModel):
+    """An illiquid home plus a single deliberate disposition/financing event."""
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    home: HomeAsset
+    decision: HousingDecision = Field(default_factory=HousingDecision)
+    costs_start_age: int | None = Field(default=None, ge=0, le=130)
+    primary_residence_gain_exclusion: float = Field(default=250_000, ge=0, le=1_000_000)
+    care: CareFundingPlan | None = None
 
 
 class IncomeTaxTreatment(StrEnum):
@@ -214,6 +362,10 @@ class TaxStrategyAssumptions(BaseModel):
         asset_classes = [item.asset_class for item in self.asset_location_preferences]
         if len(asset_classes) != len(set(asset_classes)):
             raise ValueError("asset-location asset classes must be unique")
+        if not set(asset_classes).issubset(SUPPORTED_ASSET_LOCATION_CLASSES):
+            raise ValueError(
+                "asset-location preferences require a supported asset class"
+            )
         return self
 
 
@@ -224,6 +376,7 @@ class IrmaaLookbackMagi(BaseModel):
 
     tax_year: int = Field(ge=1900, le=2200)
     magi: float = Field(ge=0)
+    filing_status: FederalFilingStatus | None = None
 
 
 class ProgressiveTaxAssumptions(BaseModel):
@@ -278,8 +431,6 @@ class ProgressiveTaxAssumptions(BaseModel):
         years = [item.tax_year for item in self.irmaa_lookback_magi]
         if len(years) != len(set(years)):
             raise ValueError("IRMAA lookback tax years must be unique")
-        if any(year >= self.simulation_start_year for year in years):
-            raise ValueError("IRMAA lookback tax years must precede simulation_start_year")
         return self
 
 
@@ -357,6 +508,15 @@ class SpendingTier(BaseModel):
     annual_amount: float = Field(gt=0)
 
 
+class AccountValuationInput(BaseModel):
+    """One immutable account value used to resolve a live portfolio."""
+
+    model_config = ConfigDict(allow_inf_nan=False, frozen=True)
+
+    account_id: str = Field(min_length=1, max_length=MAX_ACCOUNT_ID_LENGTH)
+    value: float = Field(ge=0)
+
+
 class ValuationProvenance(BaseModel):
     """Origin of a portfolio value resolved before a simulation run."""
 
@@ -365,6 +525,10 @@ class ValuationProvenance(BaseModel):
     source: str = Field(min_length=1, max_length=128)
     as_of: date | None = None
     account_ids: tuple[str, ...] = Field(
+        default=(),
+        max_length=MAX_SCENARIO_ACCOUNTS,
+    )
+    account_values: tuple[AccountValuationInput, ...] = Field(
         default=(),
         max_length=MAX_SCENARIO_ACCOUNTS,
     )
@@ -383,6 +547,16 @@ class ValuationProvenance(BaseModel):
             for account_id in self.account_ids
         ):
             raise ValueError("valuation provenance account IDs are invalid")
+        value_ids = tuple(value.account_id for value in self.account_values)
+        if len(value_ids) != len(set(value_ids)):
+            raise ValueError(
+                "valuation provenance account values must be unique"
+            )
+        if self.account_values and value_ids != self.account_ids:
+            raise ValueError(
+                "valuation provenance account values must match account IDs "
+                "in stable order"
+            )
         return self
 
 
@@ -396,6 +570,11 @@ class TaxBucket(BaseModel):
     taxable_basis: float | None = Field(default=None, ge=0)
     contribution_fraction: float = Field(default=0, ge=0, le=1)
     owner_person_id: str | None = Field(default=None, min_length=1, max_length=64)
+    account_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MAX_ACCOUNT_ID_LENGTH,
+    )
 
     @model_validator(mode="after")
     def validate_basis(self) -> TaxBucket:
@@ -467,6 +646,7 @@ class WealthScenario(BaseModel):
     contribution_inflation_adjusted: bool = True
     annual_spending: float = Field(gt=0)
     retirement_spending_plan: RetirementSpendingPlan | None = None
+    portfolio_allocation: PortfolioAllocationPlan | None = None
     income_streams: list[IncomeStream] = Field(
         default_factory=list,
         max_length=MAX_INCOME_STREAMS,
@@ -480,12 +660,14 @@ class WealthScenario(BaseModel):
         max_length=MAX_TAX_BUCKETS,
     )
     tax_assumptions: TaxAssumptions | None = None
+    housing_plan: HousingPlan | None = None
     spending_tiers: list[SpendingTier] = Field(
         default_factory=list,
         max_length=MAX_SPENDING_TIERS,
     )
     legacy_target_real: float | None = Field(default=None, ge=0)
     household: Household | None = None
+    healthcare: HealthcareAssumptions | None = None
     inflation_rate: float = Field(default=0.025, ge=-0.05, le=0.25)
     return_model: ReturnModel = ReturnModel.LOGNORMAL
     return_mean: float = Field(default=0.06, gt=-0.99, le=1.0)
@@ -511,6 +693,43 @@ class WealthScenario(BaseModel):
         account_ids = [account.id for account in self.accounts]
         if len(account_ids) != len(set(account_ids)):
             raise ValueError("scenario account IDs must be unique")
+        account_by_id = {
+            account.id: account
+            for account in self.accounts
+        }
+        linked_bucket_ids = [
+            bucket.account_id
+            for bucket in self.tax_buckets
+            if bucket.account_id is not None
+        ]
+        if linked_bucket_ids and len(linked_bucket_ids) != len(
+            self.tax_buckets
+        ):
+            raise ValueError(
+                "tax bucket account linkage must be complete or omitted"
+            )
+        if len(linked_bucket_ids) != len(set(linked_bucket_ids)):
+            raise ValueError("tax bucket account IDs must be unique")
+        unknown_bucket_accounts = (
+            set(linked_bucket_ids) - set(account_by_id)
+        )
+        if unknown_bucket_accounts:
+            raise ValueError(
+                "tax bucket account_id must identify a scenario account"
+            )
+        for bucket in self.tax_buckets:
+            if bucket.account_id is None:
+                continue
+            account = account_by_id[bucket.account_id]
+            if account.role not in LIQUID_PORTFOLIO_ROLES:
+                raise ValueError(
+                    "tax bucket account_id must identify a liquid scenario "
+                    "account"
+                )
+            if bucket.owner_person_id != account.owner_person_id:
+                raise ValueError(
+                    "linked tax bucket and scenario account owners must match"
+                )
         tier_names = [tier.name.casefold() for tier in self.spending_tiers]
         if len(tier_names) != len(set(tier_names)):
             raise ValueError("spending tier names must be unique")
@@ -603,8 +822,225 @@ class WealthScenario(BaseModel):
             for bucket in self.tax_buckets
         ):
             raise ValueError("account ownership requires a household")
+        if self.healthcare is not None:
+            if self.household is None:
+                raise ValueError("healthcare assumptions require a household")
+            healthcare_ids = {
+                person.person_id for person in self.healthcare.people
+            }
+            household_ids = {
+                person.id for person in self.household.people
+            }
+            if healthcare_ids != household_ids:
+                raise ValueError(
+                    "healthcare assumptions must cover every household person "
+                    "exactly once"
+                )
+            healthcare_has_ltc = any(
+                person.long_term_care is not None
+                for person in self.healthcare.people
+            )
+            deterministic_housing_care = (
+                self.housing_plan is not None
+                and self.housing_plan.care is not None
+                and self.housing_plan.care.annual_cost_real is not None
+            )
+            if healthcare_has_ltc and deterministic_housing_care:
+                raise ValueError(
+                    "long-term-care costs must be modeled by healthcare or "
+                    "housing care, not both"
+                )
+            if self.healthcare.ltc_funding_source == "home_equity":
+                reserve = (
+                    self.housing_plan.care
+                    if self.housing_plan is not None
+                    else None
+                )
+                if (
+                    reserve is None
+                    or reserve.funding_account_id is None
+                    or reserve.annual_cost_real is not None
+                ):
+                    raise ValueError(
+                        "home-equity LTC funding requires a reserve-only housing "
+                        "care plan with funding_account_id"
+                    )
+        if self.portfolio_allocation is not None:
+            configured_ids = {
+                account.account_id
+                for account in self.portfolio_allocation.accounts
+            }
+            liquid_ids = {
+                account.id
+                for account in self.accounts
+                if account.role in LIQUID_PORTFOLIO_ROLES
+            }
+            if self.accounts and configured_ids != liquid_ids:
+                raise ValueError(
+                    "allocation account IDs must exactly cover liquid scenario "
+                    "accounts"
+                )
+            if self.accounts and self.tax_buckets:
+                if set(linked_bucket_ids) != configured_ids:
+                    raise ValueError(
+                        "tax-aware allocation requires one linked tax bucket "
+                        "for every allocation account"
+                    )
+                if self.starting_portfolio is not None:
+                    bucket_by_account = {
+                        bucket.account_id: bucket
+                        for bucket in self.tax_buckets
+                    }
+                    for allocation_account in (
+                        self.portfolio_allocation.accounts
+                    ):
+                        bucket = bucket_by_account[
+                            allocation_account.account_id
+                        ]
+                        expected = (
+                            self.starting_portfolio
+                            * allocation_account.portfolio_weight
+                        )
+                        if abs(bucket.starting_balance - expected) > 0.01:
+                            raise ValueError(
+                                "allocation account weights must match linked "
+                                "tax bucket starting balances"
+                            )
+            tax_strategy = (
+                self.tax_assumptions.strategy
+                if self.tax_assumptions is not None
+                else None
+            )
+            if (
+                tax_strategy is not None
+                and tax_strategy.asset_location_preferences
+                and (
+                    not self.accounts
+                    or set(linked_bucket_ids) != configured_ids
+                )
+            ):
+                raise ValueError(
+                    "asset-location preferences require linked allocation "
+                    "and tax accounts"
+                )
+            if any(
+                point.age <= self.current_age
+                for account in self.portfolio_allocation.accounts
+                for point in account.glide_path
+            ):
+                raise ValueError(
+                    "allocation glide-path ages must be greater than current_age"
+                )
         self._validate_tax_model()
+        self._validate_housing_plan()
         return self
+
+    def _validate_housing_plan(self) -> None:
+        plan = self.housing_plan
+        if plan is None:
+            return
+        if not self.tax_buckets or self.tax_assumptions is None:
+            raise ValueError("housing_plan requires explicit tax_buckets and tax_assumptions")
+        event_age = plan.decision.event_age
+        if event_age is not None and not self.current_age <= event_age < self.end_age:
+            raise ValueError("housing event_age must be within the simulated ages")
+        if event_age is not None and event_age < self.retirement_age:
+            raise ValueError(
+                "housing liquidity events before retirement_age are not supported"
+            )
+        if plan.costs_start_age is not None and not (
+            self.current_age <= plan.costs_start_age < self.end_age
+        ):
+            raise ValueError("housing costs_start_age must be within the simulated ages")
+        if (
+            plan.costs_start_age is not None
+            and plan.costs_start_age < self.retirement_age
+        ):
+            raise ValueError(
+                "housing costs_start_age before retirement_age is not supported"
+            )
+        destination_id = plan.decision.proceeds_destination_account_id
+        destination_bucket: TaxBucket | None = None
+        if destination_id is not None:
+            destination_buckets = [
+                bucket
+                for bucket in self.tax_buckets
+                if bucket.account_id == destination_id
+            ]
+            if len(destination_buckets) != 1:
+                raise ValueError(
+                    "proceeds_destination_account_id must identify exactly one "
+                    "linked tax bucket"
+                )
+            destination_bucket = destination_buckets[0]
+            if destination_bucket.tax_treatment not in {
+                TaxTreatment.CASH,
+                TaxTreatment.TAXABLE,
+            }:
+                raise ValueError(
+                    "housing proceeds destination account must be cash or taxable"
+                )
+        if plan.care is not None:
+            if plan.care.start_age is not None and plan.care.end_age is not None:
+                if not (
+                    self.current_age
+                    <= plan.care.start_age
+                    <= plan.care.end_age
+                    < self.end_age
+                ):
+                    raise ValueError("care ages must be within the simulated ages")
+                if plan.care.start_age < self.retirement_age:
+                    raise ValueError("care funding before retirement_age is not supported")
+            funding_account_id = plan.care.funding_account_id
+            if funding_account_id is not None:
+                funding_start_age = plan.care.start_age
+                if (
+                    funding_start_age is None
+                    and self.healthcare is not None
+                    and self.healthcare.ltc_funding_source == "home_equity"
+                ):
+                    funding_start_age = min(
+                        person.long_term_care.minimum_onset_age
+                        for person in self.healthcare.people
+                        if person.long_term_care is not None
+                    )
+                if (
+                    event_age is None
+                    or funding_start_age is None
+                    or event_age > funding_start_age
+                    or funding_account_id != destination_id
+                    or destination_bucket is None
+                ):
+                    raise ValueError(
+                        "home-equity care funding requires the exact proceeds "
+                        "destination account and a liquidity event by care start_age"
+                    )
+        decision = plan.decision
+        replacement = decision.replacement_mortgage
+        if (
+            replacement is not None
+            and decision.replacement_home_value is not None
+            and replacement.principal > decision.replacement_home_value
+        ):
+            raise ValueError(
+                "replacement mortgage principal cannot exceed replacement home value"
+            )
+        if decision.kind is HousingDecisionKind.REVERSE_MORTGAGE:
+            principal = decision.reverse_mortgage_principal or 0.0
+            maximum_principal = (
+                plan.home.current_value * decision.reverse_mortgage_max_ltv
+            )
+            if principal > maximum_principal:
+                raise ValueError(
+                    "reverse mortgage principal exceeds configured collateral LTV"
+                )
+            available_after_origination = principal * (
+                1 - decision.reverse_mortgage_origination_rate
+            )
+            if available_after_origination < plan.home.mortgage.principal:
+                raise ValueError(
+                    "reverse mortgage proceeds must pay off the existing mortgage"
+                )
 
     def _validate_tax_model(self) -> None:
         tax_aware = bool(self.tax_buckets) or self.tax_assumptions is not None
@@ -612,23 +1048,34 @@ class WealthScenario(BaseModel):
             return
         if not self.tax_buckets or self.tax_assumptions is None:
             raise ValueError("tax_buckets and tax_assumptions must be provided together")
-        if self.starting_portfolio is None:
-            raise ValueError("tax-aware scenarios require an explicit starting_portfolio")
+        if self.starting_portfolio is None and not self.accounts:
+            raise ValueError(
+                "tax-aware scenarios require an explicit starting_portfolio "
+                "or selected scenario accounts"
+            )
         if self.withdrawal_tax_rate != 0:
             raise ValueError("tax-aware scenarios must set withdrawal_tax_rate to 0")
         bucket_keys = [
-            (bucket.tax_treatment, bucket.owner_person_id)
+            (
+                bucket.tax_treatment,
+                bucket.owner_person_id,
+                bucket.account_id,
+            )
             for bucket in self.tax_buckets
         ]
         if len(bucket_keys) != len(set(bucket_keys)):
             raise ValueError(
-                "tax_buckets must have unique tax-treatment and owner pairs"
+                "tax_buckets must have unique tax-treatment, owner, and "
+                "account identities"
             )
         treatments = [
             bucket.tax_treatment for bucket in self.tax_buckets
         ]
         bucket_total = sum(bucket.starting_balance for bucket in self.tax_buckets)
-        if abs(bucket_total - self.starting_portfolio) > 0.01:
+        if (
+            self.starting_portfolio is not None
+            and abs(bucket_total - self.starting_portfolio) > 0.01
+        ):
             raise ValueError("tax bucket balances must equal starting_portfolio")
         contribution_total = sum(bucket.contribution_fraction for bucket in self.tax_buckets)
         uses_default_contribution_allocation = self.annual_contribution > 0 or any(

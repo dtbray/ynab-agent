@@ -10,6 +10,7 @@ import json
 from typing import Protocol, runtime_checkable
 
 from ynab_agent.planning.models import (
+    AccountValuationInput,
     LIQUID_PORTFOLIO_ROLES,
     ValuationProvenance,
     WealthScenario,
@@ -244,16 +245,39 @@ class WealthService:
             }
             for account_id in selected_ids
         ]
+        negative_accounts = [
+            account_id
+            for account_id in selected_ids
+            if by_id[account_id].balance_milliunits < 0
+        ]
+        if negative_accounts:
+            raise ValueError(
+                "selected liquid accounts have negative balances: "
+                + ", ".join(negative_accounts)
+            )
+        account_values = tuple(
+            AccountValuationInput(
+                account_id=account_id,
+                value=by_id[account_id].balance_milliunits / 1000,
+            )
+            for account_id in selected_ids
+        )
         total_milliunits = sum(
             by_id[account_id].balance_milliunits for account_id in selected_ids
         )
         if total_milliunits < 0:
             raise ValueError("selected liquid account balances produce a negative portfolio")
+        validate_linked_account_values(
+            scenario,
+            account_values,
+            resolved_total=total_milliunits / 1000,
+        )
         return ResolvedStartingPortfolio(
             value=total_milliunits / 1000,
             provenance=ValuationProvenance(
                 source="cached_liquid_accounts",
                 account_ids=selected_ids,
+                account_values=account_values,
                 source_sha256=_portfolio_input_sha256(
                     {"accounts": valuation_inputs}
                 ),
@@ -430,6 +454,46 @@ class WealthService:
             valuation_source=valuation_source,
             valuation_note=valuation_note,
         )
+
+
+def validate_linked_account_values(
+    scenario: WealthScenario,
+    account_values: tuple[AccountValuationInput, ...],
+    *,
+    resolved_total: float,
+) -> None:
+    """Fail closed when live account values disagree with replay inputs."""
+    linked_buckets = {
+        bucket.account_id: bucket
+        for bucket in scenario.tax_buckets
+        if bucket.account_id is not None
+    }
+    if not linked_buckets:
+        return
+    values = {
+        account.account_id: account.value
+        for account in account_values
+    }
+    if set(linked_buckets) != set(values):
+        raise ValueError(
+            "linked tax buckets must exactly cover resolved account values"
+        )
+    for account_id, bucket in linked_buckets.items():
+        if abs(bucket.starting_balance - values[account_id]) > 0.01:
+            raise ValueError(
+                "linked tax bucket starting balance does not match resolved "
+                f"account value: {account_id}"
+            )
+    allocation = scenario.portfolio_allocation
+    if allocation is None:
+        return
+    for account in allocation.accounts:
+        expected = resolved_total * account.portfolio_weight
+        if abs(values[account.account_id] - expected) > 0.01:
+            raise ValueError(
+                "allocation account weight does not match resolved account "
+                f"value: {account.account_id}"
+            )
 
 
 def _dated_integer_history(

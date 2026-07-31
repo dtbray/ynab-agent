@@ -7,6 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ynab_agent.planning.stress import NamedStressName
 from ynab_agent.services.planner_jobs import (
     PlannerJob,
     PlannerJobState,
@@ -28,6 +29,7 @@ class PlannerJobSubmitRequest(BaseModel):
         max_length=64,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
     )
+    named_stress: NamedStressName | None = None
 
 
 class PlannerJobErrorRead(BaseModel):

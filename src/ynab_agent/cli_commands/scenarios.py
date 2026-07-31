@@ -11,6 +11,7 @@ import typer
 from ynab_agent.cli_commands.wealth_support import load_history, load_scenario
 from ynab_agent.cli_support import console, format_dollars, print_json, render_rows
 from ynab_agent.config import settings
+from ynab_agent.planning.stress import NamedStressName
 from ynab_agent.runtime import open_scenario_comparison_service
 from ynab_agent.services.scenario_comparison import (
     ScenarioComparisonError,
@@ -119,6 +120,13 @@ def compare_scenario_revisions(
             help="Alternative revision UUID; repeat for multiple alternatives",
         ),
     ],
+    named_stress: Annotated[
+        NamedStressName | None,
+        typer.Option(
+            "--named-stress",
+            help="Apply one registered deterministic market stress",
+        ),
+    ] = None,
     json_output: Annotated[
         bool,
         typer.Option("--json", help="Emit the stable comparison model as JSON"),
@@ -132,6 +140,7 @@ def compare_scenario_revisions(
                 comparison = await service.compare(
                     baseline_revision_id=baseline_revision_id,
                     alternative_revision_ids=alternative_revision_ids,
+                    named_stress=named_stress,
                 )
         except (RuntimeError, ValueError, ScenarioComparisonError) as exc:
             raise typer.BadParameter(

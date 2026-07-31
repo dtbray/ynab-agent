@@ -95,6 +95,7 @@ async def create_scenario_comparison(
         return await service.compare(
             baseline_revision_id=request.baseline_revision_id,
             alternative_revision_ids=request.alternative_revision_ids,
+            named_stress=request.named_stress,
         )
     except (ScenarioComparisonError, ValueError, RuntimeError) as exc:
         _raise_http_error(exc)

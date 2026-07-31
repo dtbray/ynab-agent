@@ -109,6 +109,7 @@ class AnnualTaxResult(BaseModel):
     aca_premium_tax_credit: float | None
     irmaa_lookback_tax_year: int
     irmaa_lookback_magi: float | None
+    irmaa_lookback_filing_status: FederalFilingStatus | None
     irmaa_tier: int | None
     irmaa_annual_surcharge: float | None
     effective_income_tax_rate: float
@@ -133,6 +134,7 @@ class _TaxComponents(TypedDict):
     aca_premium_tax_credit: float | None
     irmaa_lookback_tax_year: int
     irmaa_lookback_magi: float | None
+    irmaa_lookback_filing_status: FederalFilingStatus | None
     irmaa_tier: int | None
     irmaa_annual_surcharge: float | None
 
@@ -374,20 +376,36 @@ def _aca_values(
 def _irmaa_values(
     request: TaxCalculationInput,
     policy: dict[str, Any],
-) -> tuple[int, float | None, int | None, float | None]:
+) -> tuple[
+    int,
+    float | None,
+    FederalFilingStatus | None,
+    int | None,
+    float | None,
+]:
     irmaa = policy["irmaa"]
     lookback_year = request.tax_year - irmaa["lookback_years"]
-    magi = next(
-        (value.magi for value in request.irmaa_lookback_magi if value.tax_year == lookback_year),
+    lookback = next(
+        (
+            value
+            for value in request.irmaa_lookback_magi
+            if value.tax_year == lookback_year
+        ),
         None,
+    )
+    magi = lookback.magi if lookback is not None else None
+    lookback_status = (
+        lookback.filing_status or request.filing_status
+        if lookback is not None
+        else None
     )
     eligible_people = int(_age(request, request.taxpayer_birth_year) >= 65)
     if request.spouse_birth_year is not None:
         eligible_people += int(_age(request, request.spouse_birth_year) >= 65)
     if magi is None or eligible_people == 0:
-        return lookback_year, magi, None, None
+        return lookback_year, magi, lookback_status, None, None
     if (
-        request.filing_status is FederalFilingStatus.MARRIED_FILING_SEPARATELY
+        lookback_status is FederalFilingStatus.MARRIED_FILING_SEPARATELY
         and request.married_filing_separately_lived_with_spouse
     ):
         lower, upper = irmaa[
@@ -395,14 +413,23 @@ def _irmaa_values(
         ]
         tier = 0 if magi <= lower else 4 if magi < upper else 5
     else:
-        joint = request.filing_status is FederalFilingStatus.MARRIED_FILING_JOINTLY
+        joint = (
+            lookback_status
+            is FederalFilingStatus.MARRIED_FILING_JOINTLY
+        )
         thresholds = irmaa["joint_thresholds" if joint else "individual_thresholds"]
         tier = sum(magi > threshold for threshold in thresholds[:-1])
         tier += int(magi >= thresholds[-1])
     per_person_surcharge = 12 * (
         irmaa["part_b_monthly_adjustments"][tier] + irmaa["part_d_monthly_adjustments"][tier]
     )
-    return lookback_year, magi, tier, eligible_people * per_person_surcharge
+    return (
+        lookback_year,
+        magi,
+        lookback_status,
+        tier,
+        eligible_people * per_person_surcharge,
+    )
 
 
 def _calculate_components(
@@ -453,10 +480,13 @@ def _calculate_components(
         policy,
         federal_agi=federal_agi,
     )
-    lookback_year, lookback_magi, irmaa_tier, surcharge = _irmaa_values(
-        request,
-        policy,
-    )
+    (
+        lookback_year,
+        lookback_magi,
+        lookback_filing_status,
+        irmaa_tier,
+        surcharge,
+    ) = _irmaa_values(request, policy)
     return {
         "federal_ordinary_tax": ordinary_tax,
         "federal_long_term_capital_gains_tax": capital_gains_tax,
@@ -473,6 +503,7 @@ def _calculate_components(
         "aca_premium_tax_credit": credit,
         "irmaa_lookback_tax_year": lookback_year,
         "irmaa_lookback_magi": lookback_magi,
+        "irmaa_lookback_filing_status": lookback_filing_status,
         "irmaa_tier": irmaa_tier,
         "irmaa_annual_surcharge": surcharge,
     }
@@ -771,8 +802,11 @@ def calculate_irmaa_surcharge_arrays(
     *,
     tax_year: int,
     lookback_magi: Any | None,
+    eligible_people: Any | None = None,
+    lookback_filing_status: FederalFilingStatus | None = None,
+    lookback_joint_filing: Any | None = None,
 ) -> Any:
-    """Return current-year Part B and D IRMAA surcharges from prior MAGI."""
+    """Return IRMAA using lookback-year filing status and current enrollment."""
     import numpy as np
 
     if lookback_magi is None:
@@ -780,13 +814,23 @@ def calculate_irmaa_surcharge_arrays(
     policy, _ = load_tax_policy()
     irmaa = policy["irmaa"]
     magi = np.asarray(lookback_magi, dtype=float)
-    eligible_people = int(tax_year - assumptions.taxpayer_birth_year >= 65)
-    if assumptions.spouse_birth_year is not None:
-        eligible_people += int(tax_year - assumptions.spouse_birth_year >= 65)
-    if eligible_people == 0:
+    if eligible_people is None:
+        eligible_people = int(
+            tax_year - assumptions.taxpayer_birth_year >= 65
+        )
+        if assumptions.spouse_birth_year is not None:
+            eligible_people += int(
+                tax_year - assumptions.spouse_birth_year >= 65
+            )
+    eligible = np.asarray(eligible_people, dtype=int)
+    if not np.any(eligible):
         return np.zeros_like(magi)
     if (
-        assumptions.filing_status is FederalFilingStatus.MARRIED_FILING_SEPARATELY
+        (
+            lookback_filing_status
+            or assumptions.filing_status
+        )
+        is FederalFilingStatus.MARRIED_FILING_SEPARATELY
         and assumptions.married_filing_separately_lived_with_spouse
     ):
         lower, upper = irmaa[
@@ -794,18 +838,32 @@ def calculate_irmaa_surcharge_arrays(
         ]
         tier = np.where(magi <= lower, 0, np.where(magi < upper, 4, 5))
     else:
-        thresholds = irmaa[
-            "joint_thresholds"
-            if assumptions.filing_status is FederalFilingStatus.MARRIED_FILING_JOINTLY
-            else "individual_thresholds"
-        ]
-        tier = np.zeros_like(magi, dtype=int)
-        for threshold in thresholds[:-1]:
-            tier += magi > threshold
-        tier += magi >= thresholds[-1]
+        def tier_for(thresholds: list[float]) -> Any:
+            result = np.zeros_like(magi, dtype=int)
+            for threshold in thresholds[:-1]:
+                result += magi > threshold
+            result += magi >= thresholds[-1]
+            return result
+
+        individual_tier = tier_for(irmaa["individual_thresholds"])
+        if lookback_joint_filing is None:
+            use_joint: Any = (
+                (
+                    lookback_filing_status
+                    or assumptions.filing_status
+                )
+                is FederalFilingStatus.MARRIED_FILING_JOINTLY
+            )
+        else:
+            use_joint = np.asarray(
+                lookback_joint_filing,
+                dtype=bool,
+            )
+        joint_tier = tier_for(irmaa["joint_thresholds"])
+        tier = np.where(use_joint, joint_tier, individual_tier)
     part_b = np.asarray(irmaa["part_b_monthly_adjustments"], dtype=float)
     part_d = np.asarray(irmaa["part_d_monthly_adjustments"], dtype=float)
-    return 12 * eligible_people * (part_b[tier] + part_d[tier])
+    return 12 * eligible * (part_b[tier] + part_d[tier])
 
 
 def rmd_start_age(birth_year: int) -> int:

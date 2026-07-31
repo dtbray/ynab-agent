@@ -201,7 +201,7 @@ async def test_default_worker_executes_simulation_in_process_pool(
         assert completed.result is not None
         assert completed.result.scenario == "process pool"
         assert completed.manifest is not None
-        assert completed.manifest["engine_version"] == "wealth_simulation_v8"
+        assert completed.manifest["engine_version"] == "wealth_simulation_v12"
     finally:
         await worker.stop()
         await database.close()

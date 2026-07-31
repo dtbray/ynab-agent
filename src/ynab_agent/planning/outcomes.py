@@ -179,6 +179,7 @@ class OutcomeAccumulator:
         *,
         successful_trials: int,
         after_tax_ending_balance_real: np.ndarray | None,
+        legacy_ending_value_real: np.ndarray | None = None,
     ) -> OutcomeSummary:
         """Summarize bounded state into stable public outcome primitives."""
         import numpy as np
@@ -236,15 +237,24 @@ class OutcomeAccumulator:
         if self.scenario.legacy_target_real is not None:
             attained_trials: int | None = None
             evaluation_basis = "explicit_tax_inputs_required"
-            if after_tax_ending_balance_real is not None:
+            legacy_values = (
+                legacy_ending_value_real
+                if legacy_ending_value_real is not None
+                else after_tax_ending_balance_real
+            )
+            if legacy_values is not None:
                 attained_trials = int(
                     np.count_nonzero(
-                        after_tax_ending_balance_real + _REAL_SHORTFALL_TOLERANCE
+                        legacy_values + _REAL_SHORTFALL_TOLERANCE
                         >= self.scenario.legacy_target_real
                     )
                 )
                 legacy_probability = attained_trials / self.scenario.trials
-                evaluation_basis = "tax_adjusted_real_ending_estate"
+                evaluation_basis = (
+                    "housing_inclusive_tax_adjusted_real_ending_estate"
+                    if legacy_ending_value_real is not None
+                    else "tax_adjusted_real_ending_estate"
+                )
             goals.append(
                 GoalOutcome(
                     name="legacy_target",

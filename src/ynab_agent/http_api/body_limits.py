@@ -12,10 +12,12 @@ from .dependencies import HttpApiRuntime
 
 _BOUNDED_POST_PATHS = {
     "/planner/jobs",
+    "/wealth/allocations/validate",
     "/wealth/scenarios/revisions",
     "/wealth/scenarios/comparisons",
     "/wealth/tax/strategies/jobs",
     "/wealth/social-security/optimize",
+    "/wealth/housing/project",
 }
 
 

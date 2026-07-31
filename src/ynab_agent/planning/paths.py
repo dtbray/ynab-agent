@@ -15,7 +15,16 @@ from threading import Lock
 from types import TracebackType
 from typing import TYPE_CHECKING, Protocol, Self, cast
 
+from ynab_agent.planning.allocation import (
+    ASSET_CLASS_COUNT,
+    AssetMarketAssumptions,
+)
+from ynab_agent.planning.historical import AssetHistoricalReturns
 from ynab_agent.planning.models import ReturnModel, WealthScenario
+from ynab_agent.planning.stress import (
+    NamedStressName,
+    resolve_named_stress,
+)
 
 if TYPE_CHECKING:
     import numpy as np
@@ -54,6 +63,8 @@ class PathSpec:
     annual_fee_rate: float
     historical_block_size: int
     paired_historical_inflation: bool
+    asset_market: AssetMarketAssumptions | None = None
+    named_stress: NamedStressName | None = None
 
     def __post_init__(self) -> None:
         if self.years <= 0:
@@ -69,18 +80,28 @@ class PathSpec:
         scenario: WealthScenario,
         *,
         paired_historical_inflation: bool,
+        named_stress: NamedStressName | None = None,
     ) -> PathSpec:
+        multi_asset = scenario.portfolio_allocation is not None
         return cls(
             years=scenario.end_age - scenario.current_age,
             trials=scenario.trials,
             seed=scenario.seed,
             return_model=scenario.return_model,
-            return_mean=scenario.return_mean,
-            return_volatility=scenario.return_volatility,
+            return_mean=0 if multi_asset else scenario.return_mean,
+            return_volatility=(
+                0 if multi_asset else scenario.return_volatility
+            ),
             inflation_rate=scenario.inflation_rate,
-            annual_fee_rate=scenario.annual_fee_rate,
+            annual_fee_rate=0 if multi_asset else scenario.annual_fee_rate,
             historical_block_size=scenario.historical_block_size,
             paired_historical_inflation=paired_historical_inflation,
+            asset_market=(
+                scenario.portfolio_allocation.market
+                if scenario.portfolio_allocation is not None
+                else None
+            ),
+            named_stress=named_stress,
         )
 
 
@@ -249,6 +270,106 @@ class SimulationPaths:
     inflation_factors: np.ndarray
 
 
+@dataclass(frozen=True)
+class MultiAssetSimulationPaths(SimulationPaths):
+    """Verified custom aligned multi-asset paths."""
+
+    asset_gross_returns: np.ndarray
+    source_name: str = "custom_multi_asset_paths"
+    source_sha256: str | None = None
+    source_metadata: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        import numpy as np
+
+        if not self.source_name or len(self.source_name) > 128:
+            raise ValueError(
+                "custom multi-asset source_name must contain 1 to 128 characters"
+            )
+        if len({key for key, _ in self.source_metadata}) != len(
+            self.source_metadata
+        ):
+            raise ValueError("custom multi-asset metadata keys must be unique")
+        # Detach from every caller-owned base/view before validating or
+        # fingerprinting. Canonical float64 C-order storage makes the digest
+        # independent of input layout and prevents later base-array mutation
+        # from changing the verified paths.
+        asset_paths = np.array(
+            self.asset_gross_returns,
+            dtype=float,
+            order="C",
+            copy=True,
+        )
+        gross_paths = np.array(
+            self.gross_returns,
+            dtype=float,
+            order="C",
+            copy=True,
+        )
+        inflation = np.array(
+            self.inflation_factors,
+            dtype=float,
+            order="C",
+            copy=True,
+        )
+        if asset_paths.ndim != 3 or asset_paths.shape[0] != ASSET_CLASS_COUNT:
+            raise ValueError(
+                "custom multi-asset paths must have shape "
+                "(4, years, trials)"
+            )
+        if asset_paths.shape[1] <= 0 or asset_paths.shape[2] <= 0:
+            raise ValueError(
+                "custom multi-asset paths require positive years and trials"
+            )
+        if gross_paths.shape != asset_paths.shape[1:]:
+            raise ValueError(
+                "custom gross_returns must align with asset return paths"
+            )
+        if not np.array_equal(gross_paths, asset_paths[0]):
+            raise ValueError(
+                "custom gross_returns must equal the US-equity compatibility view"
+            )
+        if inflation.ndim not in {1, 2}:
+            raise ValueError(
+                "custom inflation factors must be one- or two-dimensional"
+            )
+        valid_inflation_shapes = {
+            (asset_paths.shape[1] + 1,),
+            (asset_paths.shape[1] + 1, asset_paths.shape[2]),
+        }
+        if inflation.shape not in valid_inflation_shapes:
+            raise ValueError(
+                "custom inflation factors must align with years and trials"
+            )
+        if (
+            np.any(~np.isfinite(asset_paths))
+            or np.any(asset_paths <= 0)
+            or np.any(~np.isfinite(gross_paths))
+            or np.any(gross_paths <= 0)
+            or np.any(~np.isfinite(inflation))
+            or np.any(inflation <= 0)
+        ):
+            raise ValueError(
+                "custom return and inflation factors must be finite and positive"
+            )
+        object.__setattr__(self, "asset_gross_returns", asset_paths)
+        object.__setattr__(self, "gross_returns", gross_paths)
+        object.__setattr__(self, "inflation_factors", inflation)
+        canonical_sha256 = _multi_asset_values_sha256(self)
+        if (
+            self.source_sha256 is not None
+            and self.source_sha256 != canonical_sha256
+        ):
+            raise ValueError(
+                "supplied custom multi-asset source_sha256 does not match "
+                "the canonical arrays and metadata"
+            )
+        asset_paths.setflags(write=False)
+        gross_paths.setflags(write=False)
+        inflation.setflags(write=False)
+        object.__setattr__(self, "source_sha256", canonical_sha256)
+
+
 class _ExperimentResources:
     """Mutable lifecycle state kept outside the frozen experiment value."""
 
@@ -344,6 +465,16 @@ class PreparedExperiment(SimulationPaths):
         repr=False,
         compare=False,
     )
+    path_values_sha256: str | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    asset_gross_returns: np.ndarray | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     @property
     def closed(self) -> bool:
@@ -374,7 +505,12 @@ class PreparedExperiment(SimulationPaths):
         )
 
     def close(self) -> None:
-        self._resources.close((self.gross_returns, self.inflation_factors))
+        return_paths = (
+            self.asset_gross_returns
+            if self.asset_gross_returns is not None
+            else self.gross_returns
+        )
+        self._resources.close((return_paths, self.inflation_factors))
 
     def __enter__(self) -> Self:
         if self.closed:
@@ -394,6 +530,89 @@ class PreparedExperiment(SimulationPaths):
             self.close()
         except Exception:
             pass
+
+
+def multi_asset_return_paths(
+    paths: SimulationPaths,
+) -> np.ndarray | None:
+    """Return aligned asset paths from built-in or custom path containers."""
+    if isinstance(paths, PreparedExperiment):
+        return paths.asset_gross_returns
+    if isinstance(paths, MultiAssetSimulationPaths):
+        return paths.asset_gross_returns
+    return None
+
+
+def multi_asset_path_manifest(
+    paths: SimulationPaths,
+) -> dict[str, object] | None:
+    """Describe built-in, historical, or named stress multi-asset paths."""
+    asset_paths = multi_asset_return_paths(paths)
+    if asset_paths is None:
+        return None
+    if isinstance(paths, PreparedExperiment):
+        return {
+            "schema_version": 1,
+            "source_name": paths.generator,
+            "source_sha256": paths.path_values_sha256,
+            "named_stress": (
+                paths.spec.named_stress.value
+                if paths.spec.named_stress is not None
+                else None
+            ),
+        }
+    if isinstance(paths, MultiAssetSimulationPaths):
+        return {
+            "schema_version": 1,
+            "source_name": paths.source_name,
+            "source_sha256": paths.source_sha256,
+            "source_metadata": dict(paths.source_metadata),
+        }
+    return None
+
+
+def _multi_asset_values_sha256(
+    paths: MultiAssetSimulationPaths,
+) -> str:
+    import numpy as np
+
+    digest = hashlib.sha256()
+    metadata = json.dumps(
+        {
+            "source_metadata": dict(paths.source_metadata),
+            "source_name": paths.source_name,
+        },
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    digest.update(metadata)
+    for name, array in (
+        ("gross_returns", paths.gross_returns),
+        ("asset_gross_returns", paths.asset_gross_returns),
+        ("inflation_factors", paths.inflation_factors),
+    ):
+        values = np.asarray(array)
+        descriptor = json.dumps(
+            {
+                "dtype": values.dtype.str,
+                "name": name,
+                "shape": values.shape,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        digest.update(descriptor)
+        iterator = np.nditer(
+            values,
+            flags=["external_loop", "buffered"],
+            op_flags=["readonly"],
+            order="C",
+            buffersize=8192,
+        )
+        for chunk in iterator:
+            digest.update(np.ascontiguousarray(chunk).view(np.uint8))
+    return digest.hexdigest()
 
 
 class PathSource(Protocol):
@@ -432,7 +651,12 @@ def estimate_path_resources(
 ) -> ResourceEstimate:
     """Estimate storage and resident peaks for memory or memmap backing."""
     effective_batch_size = min(batch_size or spec.trials, spec.trials)
-    matrix_bytes = spec.years * spec.trials * _FLOAT_BYTES
+    return_series = (
+        ASSET_CLASS_COUNT if spec.asset_market is not None else 1
+    )
+    matrix_bytes = (
+        return_series * spec.years * spec.trials * _FLOAT_BYTES
+    )
     if spec.return_model is ReturnModel.HISTORICAL_BOOTSTRAP and spec.paired_historical_inflation:
         inflation_bytes = (spec.years + 1) * spec.trials * _FLOAT_BYTES
     else:
@@ -443,6 +667,10 @@ def estimate_path_resources(
     evaluation_work_bytes = spec.trials * 4 * _FLOAT_BYTES + effective_batch_size * 4 * _FLOAT_BYTES
     if spec.return_model is ReturnModel.HISTORICAL_BOOTSTRAP:
         generation_work_bytes = spec.trials * 6 * _FLOAT_BYTES
+    elif spec.asset_market is not None:
+        generation_work_bytes = (
+            spec.trials * ASSET_CLASS_COUNT * 4 * _FLOAT_BYTES
+        )
     else:
         generation_work_bytes = spec.trials * _FLOAT_BYTES
     non_path_peak = max(evaluation_work_bytes, generation_work_bytes)
@@ -507,14 +735,23 @@ def _historical_arrays(
 def _historical_values_sha256(
     returns: Sequence[float],
     inflation: Sequence[float] | None,
+    asset_returns: AssetHistoricalReturns | None = None,
 ) -> str:
+    payload: dict[str, object] = {
+        "inflation_rates": (
+            [float(value) for value in inflation]
+            if inflation is not None
+            else None
+        ),
+        "nominal_returns": [float(value) for value in returns],
+    }
+    if asset_returns is not None:
+        payload["asset_returns"] = [
+            [float(value) for value in series]
+            for series in asset_returns
+        ]
     canonical = json.dumps(
-        {
-            "inflation_rates": (
-                [float(value) for value in inflation] if inflation is not None else None
-            ),
-            "nominal_returns": [float(value) for value in returns],
-        },
+        payload,
         allow_nan=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -527,7 +764,12 @@ def _allocate_path_arrays(
     *,
     storage: StorageKind,
     policy: RunPolicy,
-) -> tuple[np.ndarray, np.ndarray, TemporaryDirectory[str] | None]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray | None,
+    TemporaryDirectory[str] | None,
+]:
     import numpy as np
 
     inflation_shape = (
@@ -537,9 +779,27 @@ def _allocate_path_arrays(
         else (spec.years + 1,)
     )
     if storage is StorageKind.MEMORY:
+        asset_gross_returns = (
+            np.empty(
+                (
+                    ASSET_CLASS_COUNT,
+                    spec.years,
+                    spec.trials,
+                ),
+                dtype=float,
+            )
+            if spec.asset_market is not None
+            else None
+        )
+        gross_returns = (
+            asset_gross_returns[0]
+            if asset_gross_returns is not None
+            else np.empty((spec.years, spec.trials), dtype=float)
+        )
         return (
-            np.empty((spec.years, spec.trials), dtype=float),
+            gross_returns,
             np.empty(inflation_shape, dtype=float),
+            asset_gross_returns,
             None,
         )
 
@@ -554,12 +814,26 @@ def _allocate_path_arrays(
     )
     root = Path(temporary_directory.name)
     try:
-        gross_returns = np.memmap(
-            root / "gross-returns.bin",
-            mode="w+",
-            dtype=float,
-            shape=(spec.years, spec.trials),
-        )
+        if spec.asset_market is not None:
+            asset_gross_returns = np.memmap(
+                root / "asset-gross-returns.bin",
+                mode="w+",
+                dtype=float,
+                shape=(
+                    ASSET_CLASS_COUNT,
+                    spec.years,
+                    spec.trials,
+                ),
+            )
+            gross_returns = asset_gross_returns[0]
+        else:
+            asset_gross_returns = None
+            gross_returns = np.memmap(
+                root / "gross-returns.bin",
+                mode="w+",
+                dtype=float,
+                shape=(spec.years, spec.trials),
+            )
         inflation_factors = np.memmap(
             root / "inflation-factors.bin",
             mode="w+",
@@ -569,7 +843,12 @@ def _allocate_path_arrays(
     except BaseException:
         temporary_directory.cleanup()
         raise
-    return gross_returns, inflation_factors, temporary_directory
+    return (
+        gross_returns,
+        inflation_factors,
+        asset_gross_returns,
+        temporary_directory,
+    )
 
 
 def _fill_lognormal_paths(
@@ -594,6 +873,66 @@ def _fill_lognormal_paths(
         1 + spec.inflation_rate,
         np.arange(spec.years + 1, dtype=float),
     )
+
+
+def _fill_correlated_lognormal_paths(
+    asset_gross_returns: np.ndarray,
+    inflation_factors: np.ndarray,
+    spec: PathSpec,
+) -> None:
+    import numpy as np
+
+    if spec.asset_market is None:
+        raise ValueError(
+            "correlated path generation requires asset market assumptions"
+        )
+    rng = np.random.default_rng(spec.seed)
+    parameters = spec.asset_market.lognormal_parameters()
+    log_means = np.asarray(
+        [parameter[0] for parameter in parameters],
+        dtype=float,
+    )
+    log_covariance = np.asarray(
+        spec.asset_market.lognormal_covariance_matrix(),
+        dtype=float,
+    )
+    for year in range(spec.years):
+        log_returns = rng.multivariate_normal(
+            log_means,
+            log_covariance,
+            size=spec.trials,
+            check_valid="raise",
+        )
+        asset_gross_returns[:, year, :] = np.exp(log_returns).T
+    inflation_factors[:] = np.power(
+        1 + spec.inflation_rate,
+        np.arange(spec.years + 1, dtype=float),
+    )
+
+
+def _historical_asset_arrays(
+    asset_returns: AssetHistoricalReturns | None,
+    *,
+    observation_count: int,
+) -> np.ndarray:
+    import numpy as np
+
+    if asset_returns is None:
+        raise ValueError(
+            "multi-asset historical bootstrap requires all four "
+            "asset return columns"
+        )
+    values = np.asarray(asset_returns, dtype=float)
+    expected_shape = (ASSET_CLASS_COUNT, observation_count)
+    if values.shape != expected_shape:
+        raise ValueError(
+            "multi-asset history must have four aligned asset return series"
+        )
+    if np.any(~np.isfinite(values)) or np.any(values <= -1):
+        raise ValueError(
+            "multi-asset historical returns must be finite and greater than -1"
+        )
+    return values
 
 
 def _fill_historical_paths(
@@ -641,6 +980,95 @@ def _fill_historical_paths(
         )
 
 
+def _fill_multi_asset_historical_paths(
+    asset_gross_returns: np.ndarray,
+    inflation_factors: np.ndarray,
+    spec: PathSpec,
+    *,
+    historical_returns: Sequence[float] | None,
+    historical_inflation: Sequence[float] | None,
+    historical_asset_returns: AssetHistoricalReturns | None,
+) -> None:
+    """Bootstrap four assets and inflation from one aligned index sequence."""
+    import numpy as np
+
+    return_values, inflation_values = _historical_arrays(
+        historical_returns,
+        historical_inflation,
+        block_size=spec.historical_block_size,
+    )
+    asset_values = _historical_asset_arrays(
+        historical_asset_returns,
+        observation_count=return_values.size,
+    )
+    rng = np.random.default_rng(spec.seed)
+    indices = rng.integers(0, return_values.size, size=spec.trials)
+    restart_probability = 1.0 / spec.historical_block_size
+    inflation_factors[0] = 1
+
+    for year in range(spec.years):
+        if year:
+            restart = rng.random(spec.trials) < restart_probability
+            indices = (indices + 1) % return_values.size
+            restart_count = int(np.count_nonzero(restart))
+            if restart_count:
+                indices[restart] = rng.integers(
+                    0,
+                    return_values.size,
+                    size=restart_count,
+                )
+        for asset_index in range(ASSET_CLASS_COUNT):
+            np.take(
+                asset_values[asset_index],
+                indices,
+                out=asset_gross_returns[asset_index, year],
+            )
+        asset_gross_returns[:, year] += 1
+        if inflation_values is not None:
+            np.take(
+                inflation_values,
+                indices,
+                out=inflation_factors[year + 1],
+            )
+            inflation_factors[year + 1] += 1
+            inflation_factors[year + 1] *= inflation_factors[year]
+
+    if inflation_values is None:
+        inflation_factors[:] = np.power(
+            1 + spec.inflation_rate,
+            np.arange(spec.years + 1, dtype=float),
+        )
+
+
+def _fill_named_stress_paths(
+    asset_gross_returns: np.ndarray,
+    inflation_factors: np.ndarray,
+    spec: PathSpec,
+) -> str:
+    """Repeat a bounded catalog sequence over the requested horizon."""
+    import numpy as np
+
+    if spec.named_stress is None:
+        raise ValueError("named stress selector is required")
+    definition = resolve_named_stress(spec.named_stress)
+    inflation_factors[0] = 1
+    for year in range(spec.years):
+        catalog_year = year % len(definition.annual_returns)
+        gross = (
+            np.asarray(
+                definition.annual_returns[catalog_year].as_tuple(),
+                dtype=float,
+            )
+            + 1
+        )
+        asset_gross_returns[:, year, :] = gross[:, None]
+        inflation_factors[year + 1] = (
+            inflation_factors[year]
+            * (1 + definition.annual_inflation[catalog_year])
+        )
+    return definition.content_sha256
+
+
 class NumpyPathSource:
     """Generate lognormal or stationary-bootstrap paths in bounded storage."""
 
@@ -650,6 +1078,7 @@ class NumpyPathSource:
         *,
         historical_returns: Sequence[float] | None,
         historical_inflation: Sequence[float] | None,
+        historical_asset_returns: AssetHistoricalReturns | None = None,
         resource_estimate: ResourceEstimate,
     ) -> PreparedExperiment:
         """Prepare directly with the default policy for compatibility."""
@@ -663,6 +1092,7 @@ class NumpyPathSource:
                 spec,
                 historical_returns=historical_returns,
                 historical_inflation=historical_inflation,
+                historical_asset_returns=historical_asset_returns,
                 resource_estimate=resource_estimate,
                 policy=policy,
                 storage=storage,
@@ -678,18 +1108,54 @@ class NumpyPathSource:
         *,
         historical_returns: Sequence[float] | None,
         historical_inflation: Sequence[float] | None,
+        historical_asset_returns: AssetHistoricalReturns | None = None,
         resource_estimate: ResourceEstimate,
         policy: RunPolicy,
         storage: StorageKind,
         reservation: ResourceReservation,
     ) -> PreparedExperiment:
-        gross_returns, inflation_factors, temporary_directory = _allocate_path_arrays(
+        (
+            gross_returns,
+            inflation_factors,
+            asset_gross_returns,
+            temporary_directory,
+        ) = _allocate_path_arrays(
             spec,
             storage=storage,
             policy=policy,
         )
+        path_values_sha256: str | None = None
         try:
-            if spec.return_model is ReturnModel.HISTORICAL_BOOTSTRAP:
+            if asset_gross_returns is not None:
+                if spec.named_stress is not None:
+                    path_values_sha256 = _fill_named_stress_paths(
+                        asset_gross_returns,
+                        inflation_factors,
+                        spec,
+                    )
+                    generator = (
+                        f"named_stress_catalog_v1:{spec.named_stress.value}"
+                    )
+                elif spec.return_model is ReturnModel.HISTORICAL_BOOTSTRAP:
+                    _fill_multi_asset_historical_paths(
+                        asset_gross_returns,
+                        inflation_factors,
+                        spec,
+                        historical_returns=historical_returns,
+                        historical_inflation=historical_inflation,
+                        historical_asset_returns=historical_asset_returns,
+                    )
+                    generator = (
+                        "vectorized_multi_asset_stationary_bootstrap_v1"
+                    )
+                else:
+                    _fill_correlated_lognormal_paths(
+                        asset_gross_returns,
+                        inflation_factors,
+                        spec,
+                    )
+                    generator = "numpy_correlated_lognormal_v2"
+            elif spec.return_model is ReturnModel.HISTORICAL_BOOTSTRAP:
                 _fill_historical_paths(
                     gross_returns,
                     inflation_factors,
@@ -705,12 +1171,18 @@ class NumpyPathSource:
                     spec,
                 )
                 generator = "numpy_lognormal_v1"
-            gross_returns *= 1 - spec.annual_fee_rate
+            if asset_gross_returns is None:
+                gross_returns *= 1 - spec.annual_fee_rate
         except BaseException:
+            return_paths = (
+                asset_gross_returns
+                if asset_gross_returns is not None
+                else gross_returns
+            )
             _ExperimentResources(
                 reservation=reservation,
                 temporary_directory=temporary_directory,
-            ).close((gross_returns, inflation_factors))
+            ).close((return_paths, inflation_factors))
             raise
 
         return PreparedExperiment(
@@ -736,11 +1208,27 @@ class NumpyPathSource:
                 _historical_values_sha256(
                     historical_returns,
                     historical_inflation,
+                    historical_asset_returns,
                 )
                 if spec.return_model is ReturnModel.HISTORICAL_BOOTSTRAP
                 and historical_returns is not None
                 else None
             ),
+            path_values_sha256=(
+                path_values_sha256
+                or (
+                    _historical_values_sha256(
+                        historical_returns,
+                        historical_inflation,
+                        historical_asset_returns,
+                    )
+                    if spec.return_model
+                    is ReturnModel.HISTORICAL_BOOTSTRAP
+                    and historical_returns is not None
+                    else None
+                )
+            ),
+            asset_gross_returns=asset_gross_returns,
         )
 
 
@@ -749,10 +1237,29 @@ def prepare_experiment(
     *,
     historical_returns: Sequence[float] | None = None,
     historical_inflation: Sequence[float] | None = None,
+    historical_asset_returns: AssetHistoricalReturns | None = None,
+    named_stress: NamedStressName | None = None,
     path_source: PathSource | BoundedPathSource | None = None,
     run_policy: RunPolicy | None = None,
 ) -> PreparedExperiment:
     """Reserve resources, then prepare deterministic reusable paths."""
+    if named_stress is not None:
+        if scenario.portfolio_allocation is None:
+            raise ValueError(
+                "named stresses require portfolio_allocation assumptions"
+            )
+        if scenario.return_model is ReturnModel.HISTORICAL_BOOTSTRAP:
+            raise ValueError(
+                "named stresses cannot be combined with historical_bootstrap"
+            )
+        if (
+            historical_returns is not None
+            or historical_inflation is not None
+            or historical_asset_returns is not None
+        ):
+            raise ValueError(
+                "named stresses cannot be combined with historical inputs"
+            )
     policy = run_policy or RunPolicy()
     paired_inflation = (
         scenario.return_model is ReturnModel.HISTORICAL_BOOTSTRAP
@@ -761,13 +1268,35 @@ def prepare_experiment(
     spec = PathSpec.from_scenario(
         scenario,
         paired_historical_inflation=paired_inflation,
+        named_stress=named_stress,
     )
     estimate = estimate_path_resources(spec, batch_size=policy.batch_size)
     storage = policy.enforce(estimate)
-    reservation = policy.process_budget.reserve(policy.required_working_bytes(estimate))
+    reservation = policy.process_budget.reserve(
+        policy.required_working_bytes(estimate)
+    )
     try:
         source = path_source or NumpyPathSource()
+        if historical_asset_returns is not None and not isinstance(
+            source,
+            NumpyPathSource,
+        ):
+            raise ValueError(
+                "multi-asset historical data requires the bounded NumPy "
+                "path source"
+            )
         if hasattr(source, "prepare_bounded"):
+            if isinstance(source, NumpyPathSource):
+                return source.prepare_bounded(
+                    spec,
+                    historical_returns=historical_returns,
+                    historical_inflation=historical_inflation,
+                    historical_asset_returns=historical_asset_returns,
+                    resource_estimate=estimate,
+                    policy=policy,
+                    storage=storage,
+                    reservation=reservation,
+                )
             bounded_source = cast(BoundedPathSource, source)
             return bounded_source.prepare_bounded(
                 spec,
@@ -791,7 +1320,15 @@ def prepare_experiment(
                 "run_policy",
                 RunPolicySnapshot.from_policy(policy),
             )
-        if spec.return_model is ReturnModel.HISTORICAL_BOOTSTRAP and historical_returns is not None:
+        if (
+            spec.return_model is ReturnModel.HISTORICAL_BOOTSTRAP
+            and historical_returns is not None
+        ):
+            values_sha256 = _historical_values_sha256(
+                historical_returns,
+                historical_inflation,
+                historical_asset_returns,
+            )
             if experiment.historical_observation_count is None:
                 object.__setattr__(
                     experiment,
@@ -802,10 +1339,13 @@ def prepare_experiment(
                 object.__setattr__(
                     experiment,
                     "historical_values_sha256",
-                    _historical_values_sha256(
-                        historical_returns,
-                        historical_inflation,
-                    ),
+                    values_sha256,
+                )
+            if experiment.path_values_sha256 is None:
+                object.__setattr__(
+                    experiment,
+                    "path_values_sha256",
+                    values_sha256,
                 )
         return experiment
     except BaseException:

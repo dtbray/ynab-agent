@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
+from ynab_agent.planning.allocation import AssetMarketAssumptions
 from ynab_agent.planning.historical import HistoricalSeries
 from ynab_agent.planning.models import (
     ReturnModel,
@@ -25,6 +26,7 @@ from ynab_agent.planning.simulation import (
     prepare_simulation_paths,
     simulate,
 )
+from ynab_agent.planning.stress import NamedStressName
 from ynab_agent.services.planner_jobs import (
     HistoricalDatasetSnapshot,
     PlannerEngineIdentity,
@@ -32,12 +34,15 @@ from ynab_agent.services.planner_jobs import (
     PlannerQueueSaturatedError,
     PlannerResourceLimitError,
 )
-from ynab_agent.services.wealth import ResolvedStartingPortfolio
+from ynab_agent.services.wealth import (
+    ResolvedStartingPortfolio,
+    validate_linked_account_values,
+)
 
 
-SCENARIO_REVISION_SCHEMA_VERSION = 1
-SCENARIO_COMPARISON_SCHEMA_VERSION = 4
-SCENARIO_COMPARISON_POLICY_VERSION = "retirement_outcomes_v3"
+SCENARIO_REVISION_SCHEMA_VERSION = 4
+SCENARIO_COMPARISON_SCHEMA_VERSION = 8
+SCENARIO_COMPARISON_POLICY_VERSION = "retirement_outcomes_v5"
 MAX_COMPARISON_ALTERNATIVES = 12
 
 
@@ -156,6 +161,7 @@ class ChangeKind(StrEnum):
     SPENDING_POLICY = "spending_policy"
     TAX_POLICY = "tax_policy"
     HOUSEHOLD_POLICY = "household_policy"
+    HOUSING_POLICY = "housing_policy"
 
 
 class ScenarioInputChange(BaseModel):
@@ -221,6 +227,8 @@ class CommonPathManifest(BaseModel):
     annual_fee_rate: float
     historical_block_size: int
     paired_historical_inflation: bool
+    asset_market: AssetMarketAssumptions | None = None
+    named_stress: NamedStressName | None = None
     historical_observations_sha256: str | None = None
 
 
@@ -348,17 +356,33 @@ class DefaultScenarioOutcomeExtractor:
                 else None
             ),
             irmaa_exposure_probability=result.irmaa_exposure_probability,
-            estate_value_real_p50=result.ending_balance_real["p50"],
-            estate_value_real_p10=result.ending_balance_real["p10"],
+            estate_value_real_p50=(
+                result.estate_value_real["p50"]
+                if result.estate_value_real is not None
+                else result.ending_balance_real["p50"]
+            ),
+            estate_value_real_p10=(
+                result.estate_value_real["p10"]
+                if result.estate_value_real is not None
+                else result.ending_balance_real["p10"]
+            ),
             after_tax_estate_value_real_p50=(
-                result.after_tax_ending_balance_real["p50"]
-                if result.after_tax_ending_balance_real is not None
-                else None
+                result.after_tax_estate_value_real["p50"]
+                if result.after_tax_estate_value_real is not None
+                else (
+                    result.after_tax_ending_balance_real["p50"]
+                    if result.after_tax_ending_balance_real is not None
+                    else None
+                )
             ),
             after_tax_estate_value_real_p10=(
-                result.after_tax_ending_balance_real["p10"]
-                if result.after_tax_ending_balance_real is not None
-                else None
+                result.after_tax_estate_value_real["p10"]
+                if result.after_tax_estate_value_real is not None
+                else (
+                    result.after_tax_ending_balance_real["p10"]
+                    if result.after_tax_ending_balance_real is not None
+                    else None
+                )
             ),
             retirement_balance_real_p10=result.retirement_balance_real["p10"],
         )
@@ -368,6 +392,8 @@ class DefaultScenarioChangeClassifier:
     """Classify today's fields while leaving clear extension seams."""
 
     def classify(self, path: str) -> ChangeKind:
+        if "housing_plan" in path:
+            return ChangeKind.HOUSING_POLICY
         if "tax_assumptions" in path or "tax_buckets" in path or path.endswith(
             "withdrawal_tax_rate"
         ):
@@ -409,6 +435,12 @@ class ScenarioComparisonService:
         resolved = await self.portfolio_resolver.resolve_starting_portfolio_with_provenance(
             scenario
         )
+        if scenario.starting_portfolio is None:
+            validate_linked_account_values(
+                scenario,
+                resolved.provenance.account_values,
+                resolved_total=resolved.value,
+            )
         resolved_scenario = WealthScenario.model_validate(
             {
                 **scenario.model_dump(mode="python"),
@@ -471,6 +503,7 @@ class ScenarioComparisonService:
         *,
         baseline_revision_id: str,
         alternative_revision_ids: Sequence[str],
+        named_stress: NamedStressName | None = None,
     ) -> ScenarioComparison:
         alternative_ids = tuple(alternative_revision_ids)
         if len(set(alternative_ids)) != len(alternative_ids) or (
@@ -511,7 +544,11 @@ class ScenarioComparisonService:
                 ScenarioComparisonErrorCode.RESOURCE_LIMIT,
                 str(exc),
             ) from exc
-        request = _build_run_request(revisions, self.execution_policy)
+        request = _build_run_request(
+            revisions,
+            self.execution_policy,
+            named_stress=named_stress,
+        )
         if self.bounded_executor is None:
             run_result = run_scenario_comparison(request)
         else:
@@ -585,6 +622,7 @@ def historical_snapshot_from_series(
         years=series.years,
         nominal_returns=series.nominal_returns,
         inflation_rates=series.inflation_rates,
+        asset_returns=series.asset_returns,
         content_sha256=series.sha256,
         observations_sha256=series.observations_sha256,
         order_policy=series.order_policy,
@@ -619,6 +657,10 @@ def run_scenario_comparison(
         scenario,
         historical_returns=(series.nominal_returns if series is not None else None),
         historical_inflation=(series.inflation_rates if series is not None else None),
+        historical_asset_returns=(
+            series.asset_returns if series is not None else None
+        ),
+        named_stress=request.manifest.common_paths.named_stress,
         run_policy=run_policy,
     ) as paths:
         evaluations: list[ScenarioEvaluation] = []
@@ -688,6 +730,8 @@ def run_scenario_comparison(
 def _build_run_request(
     revisions: Sequence[ScenarioRevision],
     execution_policy: PlannerExecutionPolicy,
+    *,
+    named_stress: NamedStressName | None = None,
 ) -> ScenarioComparisonRunRequest:
     baseline = revisions[0]
     baseline_historical = baseline.manifest.historical_dataset
@@ -698,7 +742,20 @@ def _build_run_request(
     expected_spec = PathSpec.from_scenario(
         baseline.manifest.scenario,
         paired_historical_inflation=paired_inflation,
+        named_stress=named_stress,
     )
+    if named_stress is not None:
+        if baseline_historical is not None:
+            raise ScenarioComparisonError(
+                ScenarioComparisonErrorCode.INCOMPATIBLE_PATHS,
+                "named stresses cannot be combined with historical "
+                "comparison paths",
+            )
+        if baseline.manifest.scenario.portfolio_allocation is None:
+            raise ScenarioComparisonError(
+                ScenarioComparisonErrorCode.INCOMPATIBLE_PATHS,
+                "named stresses require multi-asset allocation assumptions",
+            )
     expected_history_hash = (
         baseline_historical.observations_sha256
         if baseline_historical is not None
@@ -711,12 +768,14 @@ def _build_run_request(
             paired_historical_inflation=(
                 historical is not None and historical.inflation_rates is not None
             ),
+            named_stress=named_stress,
         )
         if candidate_spec != expected_spec:
             raise ScenarioComparisonError(
                 ScenarioComparisonErrorCode.INCOMPATIBLE_PATHS,
                 "saved revisions must have identical horizon, trial, seed, "
-                "return, inflation, fee, and bootstrap path assumptions",
+                "return, inflation, fee, asset-market, and bootstrap path "
+                "assumptions",
             )
         candidate_hash = (
             historical.observations_sha256 if historical is not None else None
@@ -776,6 +835,16 @@ def _validate_historical_dataset(
             ScenarioComparisonErrorCode.HISTORICAL_DATASET_MISMATCH,
             "historical block size exceeds the saved observations",
         )
+    if (
+        historical_dataset is not None
+        and scenario.portfolio_allocation is not None
+        and historical_dataset.asset_returns is None
+    ):
+        raise ScenarioComparisonError(
+            ScenarioComparisonErrorCode.HISTORICAL_DATASET_MISMATCH,
+            "multi-asset historical scenarios require four aligned asset "
+            "return series",
+        )
 
 
 def _canonical_model_sha256(model: BaseModel) -> str:
@@ -803,6 +872,19 @@ def verify_scenario_revision(revision: ScenarioRevision) -> None:
         _raise_persisted_content_mismatch(
             "resolved scenario portfolio does not match its manifest"
         )
+    if manifest.valuation_provenance.account_values:
+        try:
+            validate_linked_account_values(
+                manifest.scenario,
+                manifest.valuation_provenance.account_values,
+                resolved_total=manifest.starting_portfolio,
+            )
+        except ValueError as exc:
+            raise ScenarioComparisonError(
+                ScenarioComparisonErrorCode.PERSISTED_CONTENT_MISMATCH,
+                "persisted per-account valuation inputs do not match the "
+                "resolved scenario",
+            ) from exc
     historical = manifest.historical_dataset
     if (
         historical is not None
@@ -845,6 +927,7 @@ def _verify_run_request(request: ScenarioComparisonRunRequest) -> None:
     expected_manifest = _build_run_request(
         request.revisions,
         request.manifest.execution_policy,
+        named_stress=request.manifest.common_paths.named_stress,
     ).manifest
     if request.manifest != expected_manifest:
         _raise_persisted_content_mismatch(
@@ -855,12 +938,15 @@ def _verify_run_request(request: ScenarioComparisonRunRequest) -> None:
 def _historical_snapshot_sha256(
     snapshot: HistoricalDatasetSnapshot,
 ) -> str:
+    values: dict[str, object] = {
+        "inflation_rates": snapshot.inflation_rates,
+        "nominal_returns": snapshot.nominal_returns,
+        "years": snapshot.years,
+    }
+    if snapshot.asset_returns is not None:
+        values["asset_returns"] = snapshot.asset_returns
     payload = json.dumps(
-        {
-            "inflation_rates": snapshot.inflation_rates,
-            "nominal_returns": snapshot.nominal_returns,
-            "years": snapshot.years,
-        },
+        values,
         allow_nan=False,
         separators=(",", ":"),
         sort_keys=True,

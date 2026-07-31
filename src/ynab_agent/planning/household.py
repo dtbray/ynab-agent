@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 from typing import TYPE_CHECKING
 
 from ynab_agent.planning.household_models import LongevityMode, age_months_on
@@ -25,6 +27,8 @@ HOUSEHOLD_LONGEVITY_SEED_XOR = 0x535341
 
 @dataclass(frozen=True)
 class HouseholdState:
+    inputs_sha256: str
+    inflation_factors_sha256: str
     person_ids: tuple[str, ...]
     person_alive: np.ndarray
     person_age_months: np.ndarray
@@ -36,6 +40,112 @@ class HouseholdState:
     household_alive: np.ndarray
     joint_filing: np.ndarray
     audit: list[dict[str, object]]
+
+
+def household_state_inputs_sha256(
+    scenario: WealthScenario,
+) -> str:
+    """Fingerprint every scenario input used to prepare household state."""
+    payload = {
+        "household": (
+            scenario.household.model_dump(mode="json")
+            if scenario.household is not None
+            else None
+        ),
+        "seed": scenario.seed,
+        "current_age": scenario.current_age,
+        "end_age": scenario.end_age,
+        "trials": scenario.trials,
+    }
+    canonical = json.dumps(
+        payload,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def household_inflation_factors_sha256(
+    inflation_factors: np.ndarray,
+) -> str:
+    """Fingerprint inflation paths consumed by household cash flows."""
+    import numpy as np
+
+    values = np.asarray(
+        inflation_factors,
+        dtype="<f8",
+        order="C",
+    )
+    digest = hashlib.sha256()
+    digest.update(
+        json.dumps(
+            values.shape,
+            separators=(",", ":"),
+        ).encode()
+    )
+    digest.update(values.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def validate_household_state(
+    scenario: WealthScenario,
+    state: HouseholdState | None,
+    *,
+    inflation_factors: np.ndarray,
+) -> None:
+    """Reject prepared survivorship state from another scenario or path."""
+    household = scenario.household
+    if household is None:
+        if state is not None:
+            raise ValueError(
+                "prepared_household_state requires household assumptions"
+            )
+        return
+    if state is None:
+        raise ValueError(
+            "household assumptions require prepared household state"
+        )
+    years = scenario.end_age - scenario.current_age
+    people = len(household.people)
+    expected_shape = (years, scenario.trials)
+    expected_people_shape = (people, years, scenario.trials)
+    expected_age_shape = (people, years)
+    if (
+        state.person_alive.shape != expected_people_shape
+        or state.person_age_months.shape != expected_age_shape
+        or any(
+            values.shape != expected_shape
+            for values in (
+                state.work_income,
+                state.ordinary_income,
+                state.social_security_income,
+                state.tax_free_income,
+                state.spending_fraction,
+                state.household_alive,
+                state.joint_filing,
+            )
+        )
+    ):
+        raise ValueError(
+            "prepared household state does not match scenario shape"
+        )
+    expected_people = tuple(person.id for person in household.people)
+    if state.person_ids != expected_people:
+        raise ValueError(
+            "prepared household state does not match household people"
+        )
+    if state.inputs_sha256 != household_state_inputs_sha256(scenario):
+        raise ValueError(
+            "prepared household state does not match scenario assumptions"
+        )
+    if (
+        state.inflation_factors_sha256
+        != household_inflation_factors_sha256(inflation_factors)
+    ):
+        raise ValueError(
+            "prepared household state does not match inflation paths"
+        )
 
 
 def estimate_household_state_bytes(scenario: WealthScenario) -> int:
@@ -542,6 +652,10 @@ def prepare_household_state(
             )
 
     return HouseholdState(
+        inputs_sha256=household_state_inputs_sha256(scenario),
+        inflation_factors_sha256=(
+            household_inflation_factors_sha256(inflation_factors)
+        ),
         person_ids=tuple(person.id for person in household.people),
         person_alive=np.stack(alive),
         person_age_months=np.asarray(ages_months, dtype=np.int64),

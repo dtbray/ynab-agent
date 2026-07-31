@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ynab_agent.planning.stress import NamedStressName
+
 from .wealth import ScenarioValidationRequest
 
 
@@ -30,3 +32,4 @@ class ScenarioComparisonCreateRequest(BaseModel):
         min_length=1,
         max_length=12,
     )
+    named_stress: NamedStressName | None = None

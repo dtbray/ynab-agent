@@ -26,6 +26,8 @@ from ynab_agent.workers.planner import PlannerJobWorker, PlannerRunner
 
 from .dependencies import HttpApiRuntime
 from .body_limits import PlannerRequestBodyLimitMiddleware
+from .routers.allocation import router as allocation_router
+from .routers.housing import router as housing_router
 from .routers.planner_jobs import router as planner_jobs_router
 from .routers.spending_guardrails import router as spending_guardrails_router
 from .routers.scenario_comparison import router as scenario_comparison_router
@@ -125,6 +127,8 @@ def create_app(
     )
     application.add_middleware(PlannerRequestBodyLimitMiddleware)
     application.include_router(wealth_router)
+    application.include_router(allocation_router)
+    application.include_router(housing_router)
     application.include_router(spending_guardrails_router)
     application.include_router(scenario_comparison_router)
     application.include_router(planner_jobs_router)
