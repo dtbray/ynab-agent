@@ -28,6 +28,7 @@ from ynab_agent.cli_commands.spending_guardrails import (
 )
 from ynab_agent.cli_commands.transactions import transactions_app
 from ynab_agent.cli_commands.wealth import wealth_app
+from ynab_agent.cli_commands.calibration import calibration_app
 from ynab_agent.cli_commands.housing import housing_app
 from ynab_agent.config import settings as settings
 from ynab_agent.services.sync import _resolve_plan_id as _resolve_plan_id
@@ -46,6 +47,7 @@ reports_app.add_typer(budget_activity_reports_app)
 reports_app.add_typer(spending_reports_app)
 reports_app.add_typer(obligation_reports_app)
 app.add_typer(wealth_app, name="wealth")
+wealth_app.add_typer(calibration_app, name="calibration")
 wealth_app.add_typer(allocation_app, name="allocation")
 wealth_app.add_typer(spending_guardrails_app, name="spending")
 wealth_app.add_typer(housing_app, name="housing")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import json
 from typing import cast
 
@@ -57,11 +58,47 @@ class SqlSyncStore:
             return None
         return cast(int, rows[0]["server_knowledge"])
 
+    async def begin_sync_batch(
+        self,
+        plan_id: str,
+        change_batch_id: str,
+        *,
+        started_at: datetime,
+    ) -> None:
+        """Establish durable exclusive ownership for guarded cache writes."""
+        from ynab_agent.db.calibration import SqlCalibrationRepository
+
+        await SqlCalibrationRepository(self._database).begin_sync_batch(
+            plan_id,
+            change_batch_id,
+            started_at=started_at,
+        )
+
+    async def complete_sync_batch(
+        self,
+        plan_id: str,
+        change_batch_id: str,
+        *,
+        completed_at: datetime,
+    ) -> None:
+        """Atomically freeze the completed cache generation proof."""
+        from ynab_agent.db.calibration import SqlCalibrationRepository
+
+        await SqlCalibrationRepository(
+            self._database
+        ).record_completed_sync_batch(
+            plan_id,
+            change_batch_id,
+            completed_at=completed_at,
+        )
+
     async def save_server_knowledge(
         self,
         plan_id: str,
         resource: str,
         server_knowledge: int | None,
+        *,
+        change_batch_id: str = "",
     ) -> None:
         """Persist a YNAB server knowledge checkpoint."""
         if server_knowledge is None:
@@ -73,6 +110,7 @@ class SqlSyncStore:
                     "budget_id": plan_id,
                     "resource": resource,
                     "server_knowledge": server_knowledge,
+                    "change_batch_id": change_batch_id or None,
                 }
             ],
         )
@@ -172,6 +210,7 @@ class SqlSyncStore:
                 "debt_escrow_amounts": _json_or_none(
                     account.get("debt_escrow_amounts")
                 ),
+                "change_batch_id": change_batch_id or None,
                 "deleted": account.get("deleted", False),
             }
             for account in accounts
@@ -318,6 +357,7 @@ class SqlSyncStore:
                 "goal_snoozed_at": _str_date(
                     category.get("goal_snoozed_at")
                 ),
+                "change_batch_id": change_batch_id or None,
                 "deleted": category.get("deleted", False),
             }
             for category in categories
@@ -396,6 +436,8 @@ class SqlSyncStore:
         change_batch_id: str,
     ) -> int:
         rows = [_transaction_row(plan_id, transaction) for transaction in transactions]
+        for row in rows:
+            row["change_batch_id"] = change_batch_id or None
         if change_batch_id:
             await self._changes.record_changes(
                 change_batch_id,
@@ -496,11 +538,31 @@ class SqlSyncStore:
         | type[SyncState],
         rows: list[Row],
     ) -> None:
+        batch_ids = {
+            str(row["change_batch_id"])
+            for row in rows
+            if row.get("change_batch_id")
+        }
+        budget_ids = {
+            str(row["budget_id"])
+            for row in rows
+            if row.get("budget_id")
+        }
+        active_sync_batch: tuple[str, str] | None = None
+        unbatched_source_budget_id: str | None = None
+        if batch_ids:
+            if len(batch_ids) != 1 or len(budget_ids) != 1:
+                raise ValueError("guarded sync writes require one budget and batch")
+            active_sync_batch = (next(iter(budget_ids)), next(iter(batch_ids)))
+        elif model in {Account, Transaction, Category} and len(budget_ids) == 1:
+            unbatched_source_budget_id = next(iter(budget_ids))
         await bulk_upsert(
             self._database.engine,
             self._database.session_factory,
             model,
             rows,
+            active_sync_batch=active_sync_batch,
+            unbatched_source_budget_id=unbatched_source_budget_id,
         )
 
 

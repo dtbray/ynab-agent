@@ -91,11 +91,29 @@ class SyncStore(Protocol):
 
     async def get_server_knowledge(self, plan_id: str, resource: str) -> int | None: ...
 
+    async def begin_sync_batch(
+        self,
+        plan_id: str,
+        change_batch_id: str,
+        *,
+        started_at: datetime,
+    ) -> None: ...
+
+    async def complete_sync_batch(
+        self,
+        plan_id: str,
+        change_batch_id: str,
+        *,
+        completed_at: datetime,
+    ) -> None: ...
+
     async def save_server_knowledge(
         self,
         plan_id: str,
         resource: str,
         server_knowledge: int | None,
+        *,
+        change_batch_id: str,
     ) -> None: ...
 
     async def save_budgets(
@@ -177,6 +195,17 @@ class ValuationCapture(Protocol):
     ) -> object: ...
 
 
+class PostSyncHook(Protocol):
+    """Optional automation invoked only after the complete sync is durable."""
+
+    async def after_sync(
+        self,
+        *,
+        budget_id: str,
+        source_sync_batch_id: str,
+    ) -> None: ...
+
+
 @dataclass(frozen=True)
 class SyncRequest:
     """Inputs controlling one synchronization run."""
@@ -219,12 +248,14 @@ class SyncService:
         *,
         batch_id_factory: Callable[[], str] | None = None,
         valuation_capture: ValuationCapture | None = None,
+        post_sync_hook: PostSyncHook | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._gateway = gateway
         self._store = store
         self._batch_id_factory = batch_id_factory or (lambda: str(uuid4()))
         self._valuation_capture = valuation_capture
+        self._post_sync_hook = post_sync_hook
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     async def run(self, request: SyncRequest) -> SyncSummary:
@@ -237,6 +268,14 @@ class SyncService:
             plans,
             change_batch_id=change_batch_id,
         )
+        lifecycle_started = False
+        if not uses_plan_alias:
+            await self._store.begin_sync_batch(
+                request.plan_id,
+                change_batch_id,
+                started_at=self._clock(),
+            )
+            lifecycle_started = True
 
         account_result = await self._gateway.get_accounts(
             plan_id=request.plan_id,
@@ -252,6 +291,12 @@ class SyncService:
             if uses_plan_alias
             else request.plan_id
         )
+        if not lifecycle_started:
+            await self._store.begin_sync_batch(
+                resolved_plan_id,
+                change_batch_id,
+                started_at=self._clock(),
+            )
         account_count = await self._store.save_accounts(
             resolved_plan_id,
             account_result.data,
@@ -261,6 +306,7 @@ class SyncService:
             resolved_plan_id,
             "accounts",
             account_result.server_knowledge,
+            change_batch_id=change_batch_id,
         )
         if self._valuation_capture is not None:
             await self._valuation_capture.capture_current_valuations(
@@ -284,6 +330,7 @@ class SyncService:
             resolved_plan_id,
             "payees",
             payee_result.server_knowledge,
+            change_batch_id=change_batch_id,
         )
 
         payee_locations = await self._gateway.get_payee_locations(
@@ -313,6 +360,7 @@ class SyncService:
             resolved_plan_id,
             "categories",
             category_result.server_knowledge,
+            change_batch_id=change_batch_id,
         )
 
         month_result = await self._gateway.get_months(
@@ -332,6 +380,7 @@ class SyncService:
             resolved_plan_id,
             "months",
             month_result.server_knowledge,
+            change_batch_id=change_batch_id,
         )
 
         month_category_count = 0
@@ -365,6 +414,7 @@ class SyncService:
             resolved_plan_id,
             "transactions",
             transaction_result.server_knowledge,
+            change_batch_id=change_batch_id,
         )
 
         scheduled_result = await self._gateway.get_scheduled_transactions(
@@ -387,9 +437,15 @@ class SyncService:
             resolved_plan_id,
             "scheduled_transactions",
             scheduled_result.server_knowledge,
+            change_batch_id=change_batch_id,
+        )
+        await self._store.complete_sync_batch(
+            resolved_plan_id,
+            change_batch_id,
+            completed_at=self._clock(),
         )
 
-        return SyncSummary(
+        summary = SyncSummary(
             change_batch_id=change_batch_id,
             requested_plan_id=request.plan_id,
             resolved_plan_id=resolved_plan_id,
@@ -406,6 +462,12 @@ class SyncService:
             scheduled_transaction_count=scheduled_transaction_count,
             scheduled_subtransaction_count=scheduled_subtransaction_count,
         )
+        if self._post_sync_hook is not None:
+            await self._post_sync_hook.after_sync(
+                budget_id=resolved_plan_id,
+                source_sync_batch_id=change_batch_id,
+            )
+        return summary
 
     async def _checkpoint(
         self,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import text
@@ -241,17 +242,48 @@ class DatabaseManager:
             resource,
         )
 
+    async def begin_sync_batch(
+        self,
+        budget_id: str,
+        change_batch_id: str,
+        *,
+        started_at: datetime,
+    ) -> None:
+        """Compatibility forward to the synchronization adapter."""
+        await self._sync().begin_sync_batch(
+            budget_id,
+            change_batch_id,
+            started_at=started_at,
+        )
+
+    async def complete_sync_batch(
+        self,
+        budget_id: str,
+        change_batch_id: str,
+        *,
+        completed_at: datetime,
+    ) -> None:
+        """Compatibility forward to the synchronization adapter."""
+        await self._sync().complete_sync_batch(
+            budget_id,
+            change_batch_id,
+            completed_at=completed_at,
+        )
+
     async def save_server_knowledge(
         self,
         budget_id: str,
         resource: str,
         server_knowledge: int | None,
+        *,
+        change_batch_id: str = "",
     ) -> None:
         """Compatibility forward to the synchronization adapter."""
         await self._sync().save_server_knowledge(
             budget_id,
             resource,
             server_knowledge,
+            change_batch_id=change_batch_id,
         )
 
     async def get_unnotified_transactions(self) -> list[Row]:

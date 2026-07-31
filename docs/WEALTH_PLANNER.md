@@ -957,6 +957,101 @@ Important limitations:
 - Social Security PIAs and pension amounts should come from authoritative
   personal estimates.
 
+## Continuous-calibration evidence boundary
+
+Calibration drift is plan-versus-observation, not an arbitrary comparison of
+two signed observations. A snapshot accepts the following typed plan baselines:
+
+- spending selects and exactly equals `resolved_scenario.annual_spending`;
+- contributions select and exactly equals
+  `resolved_scenario.annual_contribution`; and
+- whole-portfolio balance selects and exactly equals
+  `resolved_scenario.starting_portfolio`.
+
+The copied baseline observation must carry the matching `plan_field` selector.
+Account-level balance selects and exactly equals the linked
+`tax_buckets[account_id=…].starting_balance`. Account-level allocation selects
+and exactly equals
+`portfolio_allocation.accounts[account_id=…].target`. The snapshot verifier
+resolves both selectors from the immutable scenario revision; external
+observations cannot declare those plan values for themselves.
+
+Debt payoff is different because the scenario currently has no typed
+point-in-time debt balance. It compares one prior signed snapshot observation
+with one later signed current observation. Both roles, their chronology, and
+their source evidence are mandatory. This is a historical change detector, not
+a claim that either amount came from a plan.
+
+One exact upstream fact cannot be copied into multiple snapshot observations by
+changing only its presentation URI. Within either side of a scalar sum, a
+stable `(source_kind, source_id)` may appear only once even when its digest,
+timestamp, URI, or batch version differs. A stable source may still appear in
+different chronological roles (for example, plan baseline and current) when
+those roles refer to distinct signed versions and every earlier-role source
+`observed_at` strictly precedes the corresponding later-role source timestamp.
+Equal-time rehashes fail closed.
+
+## Living-plan automation
+
+An immutable calibration profile binds a saved scenario revision to one YNAB
+budget, a versioned materiality/freshness policy, and any reviewed allocation
+observations. A completed sync invokes calibration only after every cache row
+and server-knowledge checkpoint is durable. The resulting snapshot is written
+before its durable run is admitted.
+
+Each snapshot contains the resolved scenario, source batch and watermarks,
+copied observations with stable source identities, stale/frozen assessments,
+and replay-verified drift events for spending, contributions, linked account
+balances, reviewed allocation weights, debt payoff, and valuation freshness.
+Contribution actuals include only positive transfers from outside the selected
+liquid-account set. Direct non-transfer activity is excluded because YNAB
+cannot safely distinguish a contribution from investment income,
+reconciliation, or a market-value adjustment. Because that evidence is
+incomplete, it remains informational and does not overwrite the saved
+contribution plan without a future complete, explicitly reviewed source.
+The `(profile, sync batch)` identity is unique, so a retry or process restart
+cannot create a different snapshot or a second run.
+
+The worker evaluates the original plan, the combined calibrated inputs, and
+bounded one-factor counterfactuals using the scenario's seeded simulation. Its
+report attributes changes in success probability, median cumulative shortfall,
+median lifetime tax, and median after-tax estate value. An explicit interaction
+residual reconciles the individual marginals to the combined result. Only
+material, sufficiently confident planning-input drift changes the calibrated
+scenario. Events are grouped by driving kind before resource admission, while
+immaterial and observational-only context stays evidence-linked with a zero
+direct model effect. Historical scenarios copy the saved revision's immutable
+dataset into the snapshot and replay from that exact series.
+
+Material alerts contain only the drift kind, stable subject ID, lifecycle
+state, and timestamps. Dollar values, transaction details, account display
+names, source URIs, and evidence payloads remain in authenticated snapshot
+storage. Opening, acknowledgement, resolution, and reopening are append-only
+lifecycle events.
+
+Completed-sync markers bind watermarks to change-batch identities. Accounts,
+transactions, and spending categories retain their last change batch; capture
+checks both before and after its source reads and fails closed if a newer sync
+is incomplete or the checkpoint moves. Profile state is append-only. Disabling
+an obsolete profile stops future post-sync captures without deleting evidence.
+A failed capture on one active profile is recorded with a privacy-bounded error
+code and does not prevent other active profiles from capturing the same batch.
+
+The supported operator surface is:
+
+```text
+ynab-agent wealth calibration create --scenario-revision UUID --budget-id UUID
+ynab-agent wealth calibration capture --profile UUID --sync-batch UUID
+ynab-agent wealth calibration process
+ynab-agent wealth calibration status --profile UUID --json
+ynab-agent wealth calibration disable --profile UUID
+ynab-agent wealth calibration acknowledge --profile UUID --alert UUID
+```
+
+The authenticated HTTP equivalents live under `/wealth/calibration`. The API
+lifespan runs the same durable worker; `wealth calibration process` is suitable
+for a systemd timer when the HTTP service is not running.
+
 Natural next steps are periodic balance snapshots, side-by-side scenario
 comparison, longevity sampling, progressive tax-policy plugins,
 Roth-conversion strategies, and versioned economic assumption sets.
