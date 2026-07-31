@@ -50,3 +50,8 @@ class HttpApiSettings(BaseSettings):
         le=1024 * 1024,
     )
     planner_historical_datasets: dict[str, Path] = Field(default_factory=dict)
+    calibration_poll_interval_seconds: float = Field(
+        default=30,
+        gt=0,
+        le=3_600,
+    )

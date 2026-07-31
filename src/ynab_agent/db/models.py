@@ -62,6 +62,7 @@ class Account(Base):
     debt_interest_rates: Mapped[str | None] = mapped_column(Text)
     debt_minimum_payments: Mapped[str | None] = mapped_column(Text)
     debt_escrow_amounts: Mapped[str | None] = mapped_column(Text)
+    change_batch_id: Mapped[str | None] = mapped_column(String(64), index=True)
     deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
@@ -179,6 +180,279 @@ class ScenarioRevisionRecord(Base):
     created_at: Mapped[str] = mapped_column(String(64))
 
 
+class CalibrationProfileRecord(Base):
+    """Immutable configuration for one continuously calibrated plan."""
+
+    __tablename__ = "calibration_profiles"
+    __table_args__ = (Index("ix_calibration_profiles_budget_created", "budget_id", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    scenario_revision_id: Mapped[str] = mapped_column(
+        ForeignKey("scenario_revisions.id"),
+        index=True,
+    )
+    budget_id: Mapped[str] = mapped_column(String(64), index=True)
+    profile_json: Mapped[str] = mapped_column(Text)
+    profile_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[str] = mapped_column(String(64))
+
+
+class CalibrationSyncBatchRecord(Base):
+    """Durable lifecycle and proof for one cache synchronization batch."""
+
+    __tablename__ = "calibration_sync_batches"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    budget_id: Mapped[str] = mapped_column(String(64), index=True)
+    state: Mapped[str] = mapped_column(String(16), index=True)
+    started_at: Mapped[str] = mapped_column(String(64))
+    unowned_source_dirty: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default=false(),
+    )
+    completed_at: Mapped[str | None] = mapped_column(String(64))
+    predecessor_id: Mapped[str | None] = mapped_column(
+        ForeignKey("calibration_sync_batches.id")
+    )
+    superseded_by: Mapped[str | None] = mapped_column(
+        ForeignKey("calibration_sync_batches.id")
+    )
+    watermarks_json: Mapped[str | None] = mapped_column(Text)
+    watermarks_sha256: Mapped[str | None] = mapped_column(String(64))
+
+
+class CalibrationSyncBatchHeadRecord(Base):
+    """Authoritative cache-writer generation for one budget."""
+
+    __tablename__ = "calibration_sync_batch_heads"
+
+    budget_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    batch_id: Mapped[str | None] = mapped_column(
+        ForeignKey("calibration_sync_batches.id"),
+        unique=True,
+    )
+
+
+class CalibrationProfileEventRecord(Base):
+    """Append-only active/disabled lifecycle for a calibration profile."""
+
+    __tablename__ = "calibration_profile_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("calibration_profiles.id"),
+        index=True,
+    )
+    state: Mapped[str] = mapped_column(String(16))
+    created_at: Mapped[str] = mapped_column(String(64))
+
+
+class CalibrationCaptureFailureRecord(Base):
+    """Privacy-bounded post-sync capture failure."""
+
+    __tablename__ = "calibration_capture_failures"
+    __table_args__ = (
+        UniqueConstraint(
+            "profile_id",
+            "source_sync_batch_id",
+            name="uq_calibration_capture_failure_profile_batch",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("calibration_profiles.id"),
+        index=True,
+    )
+    source_sync_batch_id: Mapped[str] = mapped_column(String(64), index=True)
+    error_code: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[str] = mapped_column(String(64))
+
+
+class CalibrationSnapshotRecord(Base):
+    """Append-only, content-addressed inputs captured before automation."""
+
+    __tablename__ = "calibration_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "profile_id",
+            "source_sync_batch_id",
+            name="uq_calibration_snapshot_profile_batch",
+        ),
+        Index("ix_calibration_snapshots_profile_created", "profile_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("calibration_profiles.id"),
+        index=True,
+    )
+    previous_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("calibration_snapshots.id"),
+    )
+    source_sync_batch_id: Mapped[str] = mapped_column(String(64), index=True)
+    manifest_sha256: Mapped[str] = mapped_column(String(64))
+    manifest_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(String(64))
+
+
+class CalibrationProfileHeadRecord(Base):
+    """CAS pointer that serializes one profile's immutable snapshot chain."""
+
+    __tablename__ = "calibration_profile_heads"
+
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("calibration_profiles.id"),
+        primary_key=True,
+    )
+    snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("calibration_snapshots.id"),
+        unique=True,
+    )
+
+
+class CalibrationObservationRecord(Base):
+    """Queryable copy of one observation embedded in a snapshot."""
+
+    __tablename__ = "calibration_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "snapshot_id",
+            "content_sha256",
+            name="uq_calibration_observation_snapshot_hash",
+        ),
+        Index(
+            "ix_calibration_observations_subject",
+            "kind",
+            "subject_id",
+            "observed_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(200), primary_key=True)
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("calibration_snapshots.id"),
+        primary_key=True,
+    )
+    kind: Mapped[str] = mapped_column(String(32))
+    subject_id: Mapped[str] = mapped_column(String(200))
+    content_sha256: Mapped[str] = mapped_column(String(64))
+    observation_json: Mapped[str] = mapped_column(Text)
+    observed_at: Mapped[str] = mapped_column(String(64))
+
+
+class CalibrationDriftEventRecord(Base):
+    """Queryable immutable drift decision embedded in a snapshot."""
+
+    __tablename__ = "calibration_drift_events"
+
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("calibration_snapshots.id"),
+        primary_key=True,
+    )
+    content_sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    subject_id: Mapped[str] = mapped_column(String(200), index=True)
+    material: Mapped[bool] = mapped_column(Boolean)
+    event_json: Mapped[str] = mapped_column(Text)
+
+
+class CalibrationRunRecord(Base):
+    """Durable idempotent execution linked to an immutable snapshot."""
+
+    __tablename__ = "calibration_runs"
+    __table_args__ = (Index("ix_calibration_runs_state_created", "state", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("calibration_snapshots.id"),
+        unique=True,
+        index=True,
+    )
+    state: Mapped[str] = mapped_column(String(16), index=True)
+    result_sha256: Mapped[str | None] = mapped_column(String(64))
+    result_json: Mapped[str | None] = mapped_column(Text)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[str] = mapped_column(String(64))
+    started_at: Mapped[str | None] = mapped_column(String(64))
+    completed_at: Mapped[str | None] = mapped_column(String(64))
+
+
+class CalibrationAttributionRecord(Base):
+    """Content-addressed explanation for one completed calibration run."""
+
+    __tablename__ = "calibration_attribution_reports"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("calibration_runs.id"),
+        unique=True,
+        index=True,
+    )
+    content_sha256: Mapped[str] = mapped_column(String(64), unique=True)
+    report_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(String(64))
+
+
+class CalibrationAlertRecord(Base):
+    """Privacy-bounded immutable alert identity."""
+
+    __tablename__ = "calibration_alerts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("calibration_profiles.id"),
+        index=True,
+    )
+    drift_kind: Mapped[str] = mapped_column(String(32))
+    subject_id: Mapped[str] = mapped_column(String(200))
+    fingerprint_sha256: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped[str] = mapped_column(String(64))
+
+
+class CalibrationAlertEventRecord(Base):
+    """Append-only lifecycle transition for an alert."""
+
+    __tablename__ = "calibration_alert_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "alert_id",
+            "snapshot_id",
+            "state",
+            name="uq_calibration_alert_event_transition",
+        ),
+        Index("ix_calibration_alert_events_alert_created", "alert_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    alert_id: Mapped[str] = mapped_column(
+        ForeignKey("calibration_alerts.id"),
+        index=True,
+    )
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("calibration_snapshots.id"),
+        index=True,
+    )
+    state: Mapped[str] = mapped_column(String(16))
+    created_at: Mapped[str] = mapped_column(String(64))
+
+
+class CalibrationAlertHeadRecord(Base):
+    """CAS pointer to the authoritative event in one alert lifecycle."""
+
+    __tablename__ = "calibration_alert_heads"
+
+    alert_id: Mapped[str] = mapped_column(
+        ForeignKey("calibration_alerts.id"),
+        primary_key=True,
+    )
+    event_id: Mapped[str | None] = mapped_column(
+        ForeignKey("calibration_alert_events.id"),
+        unique=True,
+    )
+
+
 class ScenarioComparisonRecord(Base):
     """Persisted result and recipe for one common-path comparison."""
 
@@ -247,6 +521,7 @@ class Category(Base):
     goal_overall_funded: Mapped[int | None] = mapped_column(BigInteger)
     goal_overall_left: Mapped[int | None] = mapped_column(BigInteger)
     goal_snoozed_at: Mapped[str | None] = mapped_column(String(64))
+    change_batch_id: Mapped[str | None] = mapped_column(String(64), index=True)
     deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
@@ -325,6 +600,7 @@ class Transaction(Base):
     flag_name: Mapped[str | None] = mapped_column(String(255))
     foreign_amount: Mapped[int | None] = mapped_column(BigInteger)
     foreign_currency_code: Mapped[str | None] = mapped_column(String(16))
+    change_batch_id: Mapped[str | None] = mapped_column(String(64), index=True)
     deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
@@ -425,6 +701,7 @@ class SyncState(Base):
     budget_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     resource: Mapped[str] = mapped_column(String(64), primary_key=True)
     server_knowledge: Mapped[int] = mapped_column(BigInteger)
+    change_batch_id: Mapped[str | None] = mapped_column(String(64), index=True)
     synced_at: Mapped[str] = mapped_column(
         DateTime,
         server_default=func.now(),

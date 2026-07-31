@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Never
 
@@ -63,11 +64,33 @@ async def test_sync_adapter_persists_bulk_resources_and_checkpoints(
         )
     store = _sync_port(SqlSyncStore(database))
     try:
+        await store.begin_sync_batch(
+            "budget-1",
+            "batch-1",
+            started_at=datetime(2026, 7, 31, tzinfo=timezone.utc),
+        )
         assert await store.get_server_knowledge("budget-1", "accounts") is None
-        await store.save_server_knowledge("budget-1", "accounts", None)
+        await store.save_server_knowledge(
+            "budget-1",
+            "accounts",
+            None,
+            change_batch_id="batch-1",
+        )
         assert await store.get_server_knowledge("budget-1", "accounts") is None
-        await store.save_server_knowledge("budget-1", "accounts", 17)
+        await store.save_server_knowledge(
+            "budget-1",
+            "accounts",
+            17,
+            change_batch_id="batch-1",
+        )
         assert await store.get_server_knowledge("budget-1", "accounts") == 17
+        assert await database.fetch_all(
+            """
+            SELECT change_batch_id
+            FROM sync_state
+            WHERE budget_id = 'budget-1' AND resource = 'accounts'
+            """
+        ) == [{"change_batch_id": "batch-1"}]
 
         assert await store.save_budgets(
             [{"id": "budget-1", "name": "Main"}],
@@ -185,6 +208,18 @@ async def test_sync_adapter_persists_bulk_resources_and_checkpoints(
             ],
             change_batch_id="batch-1",
         ) == (1, 1)
+        await store.complete_sync_batch(
+            "budget-1",
+            "batch-1",
+            completed_at=datetime(2026, 7, 31, 0, 1, tzinfo=timezone.utc),
+        )
+        assert await database.fetch_all(
+            """
+            SELECT state
+            FROM calibration_sync_batches
+            WHERE id = 'batch-1'
+            """
+        ) == [{"state": "completed"}]
 
         counts = await database.fetch_all(
             """

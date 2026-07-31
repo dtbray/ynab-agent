@@ -176,12 +176,39 @@ class FakeStore:
         self.events.append(f"store:checkpoint:get:{resource}")
         return self.checkpoints.get((plan_id, resource))
 
+    async def begin_sync_batch(
+        self,
+        plan_id: str,
+        change_batch_id: str,
+        *,
+        started_at: datetime,
+    ) -> None:
+        assert plan_id
+        assert change_batch_id == "batch-1"
+        assert started_at == datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
+        self.events.append("store:batch:begin")
+
+    async def complete_sync_batch(
+        self,
+        plan_id: str,
+        change_batch_id: str,
+        *,
+        completed_at: datetime,
+    ) -> None:
+        assert plan_id
+        assert change_batch_id == "batch-1"
+        assert completed_at == datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
+        self.events.append("store:batch:complete")
+
     async def save_server_knowledge(
         self,
         plan_id: str,
         resource: str,
         server_knowledge: int | None,
+        *,
+        change_batch_id: str,
     ) -> None:
+        assert change_batch_id == "batch-1"
         self.events.append(f"store:checkpoint:save:{resource}")
         self.saved_checkpoints.append((plan_id, resource, server_knowledge))
 
@@ -301,19 +328,58 @@ class FakeValuationCapture:
         return ()
 
 
+class FakePostSyncHook:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.calls: list[tuple[str, str]] = []
+
+    async def after_sync(
+        self,
+        *,
+        budget_id: str,
+        source_sync_batch_id: str,
+    ) -> None:
+        self.events.append("service:post_sync")
+        self.calls.append((budget_id, source_sync_batch_id))
+
+
 def service(
     gateway: FakeGateway,
     store: FakeStore,
     *,
     valuation_capture: FakeValuationCapture | None = None,
+    post_sync_hook: FakePostSyncHook | None = None,
 ) -> SyncService:
     return SyncService(
         gateway,
         store,
         batch_id_factory=lambda: "batch-1",
         valuation_capture=valuation_capture,
+        post_sync_hook=post_sync_hook,
         clock=lambda: datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc),
     )
+
+
+@pytest.mark.asyncio
+async def test_post_sync_automation_runs_only_after_every_checkpoint() -> None:
+    events: list[str] = []
+    gateway = FakeGateway(events)
+    store = FakeStore(events)
+    hook = FakePostSyncHook(events)
+
+    summary = await service(
+        gateway,
+        store,
+        post_sync_hook=hook,
+    ).run(request())
+
+    assert hook.calls == [("budget-1", summary.change_batch_id)]
+    assert events.index("store:batch:begin") < events.index("store:save:accounts")
+    assert events[-3:] == [
+        "store:checkpoint:save:scheduled_transactions",
+        "store:batch:complete",
+        "service:post_sync",
+    ]
 
 
 def request(**overrides: object) -> SyncRequest:
@@ -372,6 +438,7 @@ async def test_sync_preserves_fetch_persist_checkpoint_sequence() -> None:
     assert events == [
         "gateway:plans",
         "store:save:budgets",
+        "store:batch:begin",
         "store:checkpoint:get:accounts",
         "gateway:accounts",
         "store:save:accounts",
@@ -400,6 +467,7 @@ async def test_sync_preserves_fetch_persist_checkpoint_sequence() -> None:
         "gateway:scheduled",
         "store:save:scheduled",
         "store:checkpoint:save:scheduled_transactions",
+        "store:batch:complete",
     ]
 
 
