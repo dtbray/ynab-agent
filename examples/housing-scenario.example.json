@@ -1,0 +1,104 @@
+{
+  "name": "Downsize with explicit home equity",
+  "current_age": 65,
+  "retirement_age": 65,
+  "end_age": 95,
+  "starting_portfolio": 600000,
+  "annual_contribution": 0,
+  "annual_spending": 60000,
+  "accounts": [
+    {
+      "id": "deferred-account",
+      "role": "retirement"
+    },
+    {
+      "id": "cash-account",
+      "role": "cash"
+    }
+  ],
+  "income_streams": [
+    {
+      "name": "Social Security",
+      "start_age": 67,
+      "annual_amount": 42132,
+      "inflation_adjusted": true,
+      "tax_treatment": "social_security"
+    }
+  ],
+  "tax_buckets": [
+    {
+      "account_id": "deferred-account",
+      "tax_treatment": "tax_deferred",
+      "starting_balance": 500000
+    },
+    {
+      "account_id": "cash-account",
+      "tax_treatment": "cash",
+      "starting_balance": 100000
+    }
+  ],
+  "tax_assumptions": {
+    "ordinary_income_tax_rate": 0,
+    "long_term_capital_gains_tax_rate": 0,
+    "tax_model": "progressive_us_indiana",
+    "progressive": {
+      "policy_id": "us_in_2026_v1",
+      "filing_status": "single",
+      "simulation_start_year": 2026,
+      "taxpayer_birth_year": 1961,
+      "future_policy_mode": "inflation_indexed",
+      "bracket_inflation_rate": 0.025,
+      "indiana_resident": true,
+      "aca_household_size": 1
+    },
+    "apply_required_minimum_distributions": true,
+    "withdrawal_order": [
+      "cash",
+      "tax_deferred"
+    ],
+    "retirement_surplus_destination": "cash"
+  },
+  "housing_plan": {
+    "home": {
+      "current_value": 500000,
+      "cost_basis": 100000,
+      "annual_appreciation_rate": 0.025,
+      "maintenance_rate": 0.01,
+      "property_tax_rate": 0.01,
+      "insurance_rate": 0.005,
+      "selling_cost_rate": 0.07,
+      "mortgage": {
+        "principal": 125000,
+        "annual_interest_rate": 0.0275,
+        "remaining_years": 10
+      }
+    },
+    "decision": {
+      "kind": "downsize",
+      "event_age": 70,
+      "proceeds_destination_account_id": "cash-account",
+      "replacement_home_value": 300000,
+      "replacement_mortgage": {
+        "principal": 0,
+        "annual_interest_rate": 0,
+        "remaining_years": 0
+      }
+    },
+    "costs_start_age": 65,
+    "primary_residence_gain_exclusion": 250000,
+    "care": {
+      "start_age": 80,
+      "end_age": 84,
+      "annual_cost_real": 30000,
+      "funding_account_id": "cash-account"
+    }
+  },
+  "inflation_rate": 0.025,
+  "return_model": "lognormal",
+  "return_mean": 0.06,
+  "return_volatility": 0.16,
+  "annual_fee_rate": 0.002,
+  "withdrawal_tax_rate": 0,
+  "trials": 10000,
+  "seed": 20260728
+}
