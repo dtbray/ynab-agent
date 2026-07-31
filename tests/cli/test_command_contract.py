@@ -59,11 +59,20 @@ COMMAND_TREE = {
         "tax",
         "tax-strategy",
         "housing",
+        "calibration",
     },
     ("wealth", "allocation"): {"validate", "stresses"},
     ("wealth", "spending"): {"map", "list", "baseline", "preview"},
     ("wealth", "scenarios"): {"save", "compare"},
     ("wealth", "housing"): {"project"},
+    ("wealth", "calibration"): {
+        "create",
+        "capture",
+        "process",
+        "status",
+        "disable",
+        "acknowledge",
+    },
 }
 
 LEAF_COMMANDS = (
@@ -96,6 +105,12 @@ LEAF_COMMANDS = (
     ("reports", "cost-to-be-me"),
     ("reports", "hygiene"),
     ("wealth", "accounts"),
+    ("wealth", "calibration", "create"),
+    ("wealth", "calibration", "capture"),
+    ("wealth", "calibration", "process"),
+    ("wealth", "calibration", "status"),
+    ("wealth", "calibration", "disable"),
+    ("wealth", "calibration", "acknowledge"),
     ("wealth", "tax"),
     ("wealth", "tax-strategy"),
     ("wealth", "housing", "project"),

@@ -133,6 +133,11 @@ def test_openapi_exposes_only_the_intended_service_surface() -> None:
         "/planner/jobs",
         "/planner/jobs/{job_id}",
         "/planner/jobs/{job_id}/result",
+        "/wealth/calibration/profiles",
+        "/wealth/calibration/profiles/{profile_id}/capture",
+        "/wealth/calibration/profiles/{profile_id}",
+        "/wealth/calibration/profiles/{profile_id}/disable",
+        "/wealth/calibration/profiles/{profile_id}/alerts/{alert_id}/acknowledge",
     }
     assert set(schema["paths"]["/wealth/accounts/freshness"]) == {"get"}
     assert set(

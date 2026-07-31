@@ -35,6 +35,10 @@ from ynab_agent.services.social_security import (
     SocialSecurityOptimizationExecutor,
 )
 from ynab_agent.services.wealth import WealthService
+from ynab_agent.services.calibration import (
+    CalibrationRepository,
+    CalibrationService,
+)
 
 from .settings import HttpApiSettings
 
@@ -51,6 +55,7 @@ class HttpApiRuntime:
     planner_execution_policy: PlannerExecutionPolicy
     scenario_comparison_executor: BoundedScenarioComparisonExecutor
     social_security_optimizer: SocialSecurityOptimizationExecutor
+    calibration_repository: CalibrationRepository
     database_factory: DatabaseFactory = DatabaseManager
 
 
@@ -145,6 +150,31 @@ def get_social_security_optimizer(
 SocialSecurityOptimizerDep = Annotated[
     SocialSecurityOptimizationExecutor,
     Depends(get_social_security_optimizer),
+]
+
+
+def get_calibration_service(
+    runtime: HttpRuntimeDep,
+) -> CalibrationService:
+    """Return the lifespan-owned append-only calibration service."""
+    return CalibrationService(runtime.calibration_repository)
+
+
+CalibrationServiceDep = Annotated[
+    CalibrationService,
+    Depends(get_calibration_service),
+]
+
+
+def get_calibration_repository(
+    runtime: HttpRuntimeDep,
+) -> CalibrationRepository:
+    return runtime.calibration_repository
+
+
+CalibrationRepositoryDep = Annotated[
+    CalibrationRepository,
+    Depends(get_calibration_repository),
 ]
 
 

@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+## 0.9.0 - 2026-07-31
+
+### Added
+- Continuously calibrate saved wealth plans against YNAB spending,
+  contributions, debt, balances, asset allocation, valuation freshness, and
+  frozen assumptions.
+- Persist content-addressed calibration profiles, snapshots, source
+  observations, drift events, durable runs, attribution reports, and
+  append-only material-alert lifecycles.
+- Explain changes in success, shortfall, lifetime tax, and after-tax estate
+  outcomes with deterministic, bounded grouped-factor attribution.
+- Expose authenticated calibration profile, capture, status, disable, and
+  alert-acknowledgement operations alongside matching Typer commands and a
+  restart-safe scheduled worker.
+
+### Fixed
+- Bind every sync checkpoint and calibrated cache write to a durable,
+  per-budget batch lifecycle with locked ownership, abandoned-batch
+  supersession, stale-writer rejection, and atomic completion proofs.
+- Recover safely from a crash after the final checkpoint but before
+  calibration capture, including later partial deltas, clean legacy bootstrap,
+  unbatched notification writes, and histories with more than 1,000 completed
+  source owners.
+- Bound fixed-length and streamed calibration request bodies before JSON
+  parsing.
+- Make the private-to-public release publisher portable across older
+  self-hosted runners, idempotent after partial publication, and independent of a
+  preinstalled GitHub CLI.
+
+### Tests
+- Add deterministic replay, tamper, freshness, drift, attribution, resource,
+  crash-recovery, overlapping-sync, stale-writer, bootstrap, alert-lifecycle,
+  CLI/HTTP parity, migration, and request-body coverage.
+
 ## 0.8.0 - 2026-07-30
 
 ### Added

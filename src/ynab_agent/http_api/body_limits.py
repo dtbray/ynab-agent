@@ -13,12 +13,14 @@ from .dependencies import HttpApiRuntime
 _BOUNDED_POST_PATHS = {
     "/planner/jobs",
     "/wealth/allocations/validate",
+    "/wealth/calibration/profiles",
     "/wealth/scenarios/revisions",
     "/wealth/scenarios/comparisons",
     "/wealth/tax/strategies/jobs",
     "/wealth/social-security/optimize",
     "/wealth/housing/project",
 }
+_CALIBRATION_PROFILE_PATH_PREFIX = "/wealth/calibration/profiles/"
 
 
 class PlannerRequestBodyLimitMiddleware:
@@ -36,7 +38,7 @@ class PlannerRequestBodyLimitMiddleware:
         if (
             scope["type"] != "http"
             or scope["method"] != "POST"
-            or scope["path"] not in _BOUNDED_POST_PATHS
+            or not _is_bounded_post_path(scope["path"])
         ):
             await self.app(scope, receive, send)
             return
@@ -76,6 +78,16 @@ class PlannerRequestBodyLimitMiddleware:
         await self.app(scope, replay, send)
 
 
+def _is_bounded_post_path(path: str) -> bool:
+    if path in _BOUNDED_POST_PATHS:
+        return True
+    if not path.startswith(_CALIBRATION_PROFILE_PATH_PREFIX):
+        return False
+    profile_operation = path.removeprefix(_CALIBRATION_PROFILE_PATH_PREFIX)
+    profile_id, separator, operation = profile_operation.partition("/")
+    return bool(profile_id and separator and operation == "capture")
+
+
 def _content_length(scope: Scope) -> int | None:
     for key, value in scope["headers"]:
         if key.lower() == b"content-length":
@@ -95,6 +107,8 @@ async def _send_too_large(
         message = "planner job request body exceeds the configured limit"
     elif scope["path"] == "/wealth/social-security/optimize":
         message = "Social Security optimization request body exceeds the configured limit"
+    elif scope["path"].startswith("/wealth/calibration/"):
+        message = "calibration request body exceeds the configured limit"
     else:
         message = "scenario request body exceeds the configured limit"
     response = JSONResponse(

@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import pytest
 from alembic import command
 from alembic.config import Config
@@ -86,6 +88,11 @@ async def test_database_manager_records_latest_sync_changes(tmp_path):
     db = DatabaseManager(f"sqlite+aiosqlite:///{tmp_path / 'ynab.db'}")
     await db.initialize()
 
+    await db.begin_sync_batch(
+        "budget-1",
+        "batch-1",
+        started_at=datetime(2026, 7, 31, tzinfo=timezone.utc),
+    )
     await db.save_accounts(
         "budget-1",
         [
@@ -100,6 +107,11 @@ async def test_database_manager_records_latest_sync_changes(tmp_path):
             }
         ],
         change_batch_id="batch-1",
+    )
+    await db.begin_sync_batch(
+        "budget-1",
+        "batch-2",
+        started_at=datetime(2026, 7, 31, 0, 1, tzinfo=timezone.utc),
     )
     await db.save_accounts(
         "budget-1",

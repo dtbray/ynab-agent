@@ -12,6 +12,7 @@ import typer
 from ynab_agent.cli_support import console
 from ynab_agent.config import settings
 from ynab_agent.db.wealth import SqlWealthRepository
+from ynab_agent.db.calibration import SqlCalibrationRepository
 from ynab_agent.runtime import open_database
 from ynab_agent.services.sync import (
     SyncGateway,
@@ -20,6 +21,7 @@ from ynab_agent.services.sync import (
     SyncStore,
 )
 from ynab_agent.services.wealth import WealthService
+from ynab_agent.services.calibration import CalibrationService
 
 
 sync_app = typer.Typer()
@@ -92,11 +94,13 @@ def sync(
         console.print("🔄 Syncing YNAB data...")
         async with open_database(settings, initialize=True) as database:
             wealth_service = WealthService(SqlWealthRepository(database))
+            calibration_service = CalibrationService(SqlCalibrationRepository(database))
             async with YnabClient() as client:
                 service = SyncService(
                     cast(SyncGateway, client),
                     cast(SyncStore, database),
                     valuation_capture=wealth_service,
+                    post_sync_hook=calibration_service,
                     clock=lambda: datetime.now(timezone.utc),
                 )
                 summary = await service.run(request)
