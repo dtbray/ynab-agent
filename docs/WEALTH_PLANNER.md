@@ -1040,18 +1040,19 @@ code and does not prevent other active profiles from capturing the same batch.
 The supported operator surface is:
 
 ```text
-ynab-agent wealth calibration create --scenario-revision UUID --budget-id UUID
-ynab-agent wealth calibration capture --profile UUID --sync-batch UUID
-ynab-agent wealth calibration process
-ynab-agent wealth calibration status --profile UUID --json
-ynab-agent wealth calibration disable --profile UUID
-ynab-agent wealth calibration acknowledge --profile UUID --alert UUID
+ynab wealth calibration create --scenario-revision UUID --budget-id UUID
+ynab wealth calibration capture --profile UUID --sync-batch UUID
+ynab wealth calibration process
+ynab wealth calibration status --profile UUID --json
+ynab wealth calibration disable --profile UUID
+ynab wealth calibration acknowledge --profile UUID --alert UUID
 ```
 
 The authenticated HTTP equivalents live under `/wealth/calibration`. The API
 lifespan runs the same durable worker; `wealth calibration process` is suitable
 for a systemd timer when the HTTP service is not running.
 
-Natural next steps are periodic balance snapshots, side-by-side scenario
-comparison, longevity sampling, progressive tax-policy plugins,
-Roth-conversion strategies, and versioned economic assumption sets.
+Natural next steps include additional tax jurisdictions and policy plugins,
+broader investment-data adapters, versioned economic assumption sets, and
+review workflows for adopting calibrated observations into new scenario
+revisions.

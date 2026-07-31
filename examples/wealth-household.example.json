@@ -1,0 +1,105 @@
+{
+  "name": "Two-person household Social Security comparison",
+  "current_age": 66,
+  "retirement_age": 66,
+  "end_age": 100,
+  "starting_portfolio": 750000,
+  "accounts": [],
+  "annual_contribution": 0,
+  "annual_spending": 72000,
+  "household": {
+    "plan_start_date": "2026-01-02",
+    "survivor_spending_fraction": 0.75,
+    "longevity_correlation": 0.35,
+    "earnings_test_policy_year": 2026,
+    "people": [
+      {
+        "id": "alex",
+        "name": "Alex",
+        "birth_date": "1960-01-02",
+        "retirement_age_months": 792,
+        "primary_insurance_amount_monthly": 3200,
+        "social_security_claim_age_months": 804,
+        "survivor_claim_age_months": 720,
+        "work": [],
+        "pensions": [
+          {
+            "name": "Alex pension",
+            "start_age": 67,
+            "annual_amount": 18000,
+            "inflation_adjusted": false,
+            "survivor_fraction": 0.5
+          }
+        ],
+        "longevity": {
+          "mode": "probabilistic",
+          "death_age": null,
+          "mean_death_age": 88,
+          "standard_deviation_years": 6,
+          "minimum_death_age": 70,
+          "maximum_death_age": 110
+        }
+      },
+      {
+        "id": "blair",
+        "name": "Blair",
+        "birth_date": "1962-01-02",
+        "retirement_age_months": 780,
+        "primary_insurance_amount_monthly": 1800,
+        "social_security_claim_age_months": 780,
+        "survivor_claim_age_months": 720,
+        "work": [
+          {
+            "start_age": 64,
+            "end_age": 64,
+            "annual_covered_earnings": 30000
+          }
+        ],
+        "pensions": [],
+        "longevity": {
+          "mode": "probabilistic",
+          "death_age": null,
+          "mean_death_age": 91,
+          "standard_deviation_years": 5,
+          "minimum_death_age": 70,
+          "maximum_death_age": 110
+        }
+      }
+    ]
+  },
+  "income_streams": [],
+  "cash_flow_streams": [],
+  "tax_buckets": [
+    {
+      "tax_treatment": "tax_deferred",
+      "starting_balance": 500000,
+      "owner_person_id": "alex"
+    },
+    {
+      "tax_treatment": "roth",
+      "starting_balance": 150000,
+      "owner_person_id": "blair"
+    },
+    {
+      "tax_treatment": "taxable",
+      "starting_balance": 100000,
+      "taxable_basis": 80000
+    }
+  ],
+  "tax_assumptions": {
+    "ordinary_income_tax_rate": 0.12,
+    "long_term_capital_gains_tax_rate": 0.15,
+    "social_security_taxable_fraction": 0.85,
+    "apply_required_minimum_distributions": true,
+    "withdrawal_order": ["taxable", "tax_deferred", "roth"],
+    "retirement_surplus_destination": "taxable"
+  },
+  "inflation_rate": 0.025,
+  "return_model": "lognormal",
+  "return_mean": 0.06,
+  "return_volatility": 0.16,
+  "annual_fee_rate": 0.002,
+  "withdrawal_tax_rate": 0,
+  "trials": 10000,
+  "seed": 20260728
+}
